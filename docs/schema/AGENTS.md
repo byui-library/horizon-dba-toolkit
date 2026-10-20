@@ -268,9 +268,18 @@ reference site these were all unavailable:
   At a slightly higher level it exists but rejects `WITHIN GROUP`.
 - `CONCAT`, `IIF`, `FORMAT`, `OFFSET/FETCH`.
 
-`FOR XML PATH` is the usual pre-2017 substitute for string aggregation, but it
-**fails on `bib.text`**, which embeds `CHAR(31)`/`CHAR(30)` control characters
-that are illegal in XML. It is safe for clean identifiers.
+`FOR XML PATH` is the usual pre-2017 substitute for string aggregation. On
+`bib.text` it **runs**, but it **entitizes** the `CHAR(31)`/`CHAR(30)`
+delimiters rather than preserving them: the aggregate comes back with `&#x1F;`
+and `&#x1E;` where the delimiters were, and needs un-escaping before the value
+means anything.
+
+> **Corrected 2026-10-19.** This rule previously said it *fails* on `bib.text`
+> because the control characters are illegal in XML. Measured on SQL Server 2014
+> at compatibility level 120 it does not fail — it succeeds both on a literal
+> `CHAR(31)` and on real `bib.text`, entitizing the delimiters. Check
+> [`site-profile.md`](site-profile.md#engine-features) for your own engine rather
+> than taking either claim on trust.
 
 > **What your engine actually allows** is probed and tabulated in
 > [`site-profile.md`](site-profile.md#engine-features) — each feature was run,

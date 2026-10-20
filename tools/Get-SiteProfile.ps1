@@ -59,6 +59,8 @@ param(
     [Parameter(Mandatory=$false)]
     [System.Management.Automation.PSCredential] $Credential,
 
+    [string] $SqlLogin,
+
     [string] $OutFile,
 
     [ValidateRange(7, 400)]
@@ -68,8 +70,35 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'HorizonSql.ps1')
 
+# Credentials are gathered with Read-Host rather than Get-Credential.
+#
+# Get-Credential raises a GUI dialog, and on the first live run of this script
+# that dialog never appeared - not in a child process from "powershell -File",
+# and not in an interactive session either. It returns $null when its prompt is
+# cancelled OR never shown, with no way to tell the two apart, and the null then
+# reached New-HorizonConnection as "Cannot bind argument to parameter
+# 'Credential' because it is null": an error that blames the parameter and says
+# nothing about a missing dialog.
+#
+# Read-Host prompts in the console, so it works wherever the script runs -
+# including over RDP, in a remoting session, and in the constrained consoles
+# this toolkit will meet at other sites. -AsSecureString keeps the password off
+# the screen and out of the command history.
+#
+# -Credential is still honoured when a caller supplies one, and -SqlLogin skips
+# the first prompt for scripted use.
 if (-not $Credential) {
-    $Credential = Get-Credential -Message "SQL login with read access to $Database"
+    if (-not $SqlLogin) {
+        $SqlLogin = Read-Host "SQL login with read access to $Database"
+    }
+    if (-not $SqlLogin) {
+        throw 'No SQL login was entered. Re-run and supply one, or pass -SqlLogin or -Credential.'
+    }
+    $SqlPassword = Read-Host "Password for $SqlLogin" -AsSecureString
+    if (-not $SqlPassword -or $SqlPassword.Length -eq 0) {
+        throw "No password was entered for '$SqlLogin'. Re-run and supply one, or pass -Credential."
+    }
+    $Credential = New-Object System.Management.Automation.PSCredential($SqlLogin, $SqlPassword)
 }
 if (-not $OutFile) {
     $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -94,11 +123,30 @@ function Test-Feature {
         reliable signal - the catalog views that would answer the question
         directly are themselves version-gated, so probing with them just moves
         the problem one level down.
+
+        Every probe must be written so that it CANNOT return an empty result.
+        "No exception" alone does not mean available: a probe whose rows come
+        from a table may match nothing, evaluate nothing, raise nothing, and
+        then be scored as working. That happened twice to the FOR XML PATH
+        probe before it was rewritten to test the capability directly instead
+        of sampling data for it.
+
+        A probe that returns no value is therefore reported as inconclusive
+        rather than available, because the two are not the same and silently
+        conflating them is the more dangerous direction: it tells a site a
+        technique is safe when it has not been exercised at all.
     #>
     param($Conn, [string] $Name, [string] $Sql)
     try {
         $cmd = New-HorizonCommand -Connection $Conn -Sql $Sql -Timeout 30
-        [void] $cmd.ExecuteScalar()
+        $result = $cmd.ExecuteScalar()
+        if ($null -eq $result -or $result -is [System.DBNull]) {
+            return [pscustomobject]@{
+                Feature   = $Name
+                Available = $false
+                Detail    = 'INCONCLUSIVE - the probe ran without error but produced no value, so nothing was actually exercised. Treat as unproven and check by hand.'
+            }
+        }
         return [pscustomobject]@{ Feature = $Name; Available = $true; Detail = '' }
     } catch {
         # First line only: the full SqlException carries a stack trace that
@@ -253,7 +301,26 @@ ORDER BY COUNT(*) DESC;
         @{ n = 'FORMAT';                  s = "SELECT FORMAT(1, '0');" },
         @{ n = 'TRY_CONVERT';             s = "SELECT TRY_CONVERT(int, '1');" },
         @{ n = 'OFFSET / FETCH';          s = "SELECT name FROM sys.objects ORDER BY name OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY;" },
-        @{ n = 'FOR XML PATH on bib.text'; s = "SELECT TOP 1 (SELECT TOP 3 b.text AS [text()] FROM bib b WHERE b.[bib#] = x.[bib#] FOR XML PATH('')) AS agg FROM (SELECT TOP 1 [bib#] FROM bib) x;" }
+        # Measured 2026-10-19, SQL Server 2014 at compatibility level 120:
+        # FOR XML PATH does NOT fail on MARC control characters. It entitizes
+        # them - CHAR(31) comes back as &#x1F; and CHAR(30) as &#x1E; - and
+        # returns successfully, on real bib.text as well as on a literal.
+        #
+        # Both this toolkit and the repository it came from had asserted the
+        # opposite, that it throws because the characters are illegal in XML.
+        # That claim is not reproducible here and the docs have been corrected.
+        #
+        # So this probe reports "yes", which is correct. The real caveat is the
+        # entitization, not an error: an aggregate built this way contains
+        # &#x1F; and &#x1E; where the delimiters were, so it needs un-escaping
+        # before the value means anything. The generated page says so.
+        #
+        # Kept self-contained deliberately. Two earlier versions sampled bib,
+        # and while both happened to give the right answer, neither would have
+        # on a database with no bib rows - and an empty result scored as
+        # "available" either way, which is why Test-Feature now reports a
+        # valueless probe as inconclusive.
+        @{ n = 'FOR XML PATH with MARC control chars'; s = "SELECT (SELECT CHAR(31) AS [text()] FOR XML PATH('')) AS agg;" }
     )
     $features = @()
     foreach ($p in $probes) { $features += (Test-Feature $conn $p.n $p.s) }
@@ -422,6 +489,22 @@ if ($missing.Count -gt 0) {
     Add-Line 'to a lower common denominator and will still run.'
 }
 Add-Line ''
+# The FOR XML PATH row needs a caveat its yes/no column cannot carry: the
+# failure mode is entitization, not an error. Stated whenever the probe passed,
+# because that is exactly when a reader would otherwise assume it is usable.
+if (@($features | Where-Object { $_.Feature -like 'FOR XML PATH*' -and $_.Available }).Count -gt 0) {
+    Add-Line '> **`FOR XML PATH` runs, but read the caveat before aggregating MARC text.**'
+    Add-Line '>'
+    Add-Line '> It does not fail on the `CHAR(31)`/`CHAR(30)` delimiters in `bib.text` - it'
+    Add-Line '> **entitizes** them. They come back as `&#x1F;` and `&#x1E;`, so an aggregate'
+    Add-Line '> built this way holds entity references where the delimiters were and needs'
+    Add-Line '> un-escaping before the value means anything.'
+    Add-Line '>'
+    Add-Line '> Measured, not assumed: on SQL Server 2014 at compatibility level 120 this'
+    Add-Line '> succeeds on a literal `CHAR(31)` and on real `bib.text`. Earlier versions of'
+    Add-Line '> this toolkit asserted that it throws. That was wrong.'
+    Add-Line ''
+}
 
 Add-Line '## Size'
 Add-Line ''
