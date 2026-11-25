@@ -28,6 +28,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'HorizonSql.ps1')   # ConvertTo-BareSql
 
 if (-not $RepoRoot) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -108,8 +109,11 @@ function Test-IsWrite {
     #>
     param([string] $Code)
 
-    # Strip comments and string literals so keywords inside them do not count.
-    $bare = $Code -replace '(?m)--[^\n]*', ' ' -replace "'(?:''|[^'])*'", " '' "
+    # Blank strings, comments and [identifiers] in one pass (HorizonSql.ps1),
+    # so keywords inside them do not count and none can hide behind a quote or
+    # comment marker. Unparseable SQL fails closed.
+    $bare = ConvertTo-BareSql -Code $Code
+    if ($null -eq $bare) { return $true }
 
     if ($bare -match '(?im)\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|GRANT|REVOKE|TRUNCATE|MERGE|EXEC|EXECUTE|BACKUP|RESTORE|DENY|SET\s+LOCK_TIMEOUT)\b') { return $true }
     if ($bare -match '(?is)\bSELECT\b.*\bINTO\b\s+[\[\w#]') { return $true }   # SELECT ... INTO

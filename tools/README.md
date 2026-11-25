@@ -9,6 +9,7 @@ directly, so no `SqlServer` module is needed. Nothing has to be installed.
 
 | Script | Group | Touches the catalog? |
 | --- | --- | --- |
+| [`Invoke-ReadOnlyQuery.ps1`](#invoke-readonlyqueryps1) | query | no (read-only, enforced) |
 | [`Get-SiteProfile.ps1`](#get-siteprofileps1) | setup | no (read-only) |
 | [`Generate-SchemaDocs.ps1`](#generate-schemadocsps1) | setup | no |
 | [`Test-Tools.ps1`](#test-toolsps1) | — | no (no database at all) |
@@ -154,6 +155,94 @@ an unexplained reason is a decision for a human holding the diagnostic. See
 ---
 
 # Script reference
+
+## `Invoke-ReadOnlyQuery.ps1`
+
+Runs one read-only batch against the database named in the gitignored
+`tools\site.local.psd1` (copy [`site.local.example.psd1`](site.local.example.psd1)),
+using Windows authentication. It prints the result and can save the first result
+set as a fully quoted UTF-8 CSV. This is the only route an AI assistant uses
+into the live catalog; see the root [`AGENTS.md`](../AGENTS.md).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT COUNT(*) AS n FROM bib_control"
+powershell -ExecutionPolicy Bypass -File tools\Invoke-ReadOnlyQuery.ps1 -File solutions\<name>\sql\01-....sql -OutCsv "excel reports\<name>.csv"
+```
+
+Read-only in four layers. The first is enforced by SQL Server itself; the
+others give friendlier errors and a second line of defence:
+
+1. **Runs as the database user `ro_query`.** Right after connecting with the
+   caller's Windows login, the tool runs
+   `EXECUTE AS USER = 'ro_query' WITH NO REVERT`. From then on, SQL Server
+   checks every statement against `ro_query`, which holds only `db_datareader`,
+   so any write fails with *permission denied*, even when the caller's own
+   login is `sysadmin`. `NO REVERT` stops the batch from switching back, and
+   the connection is never pooled. **If the switch fails, nothing runs.**
+2. **Refused before sending** if the batch contains a write (`INSERT`,
+   `UPDATE`, `DELETE`, `MERGE`, DDL, `GRANT`, `EXEC`, `SELECT ... INTO`, ...),
+   anything that could end the transaction (`COMMIT`, `ROLLBACK`), a lock hint
+   or `WAITFOR` that would hold locks until the rollback, an external data
+   source, a `GO`, or does not start with `SELECT`, `WITH`, `DECLARE` or `SET`.
+   Strings, comments and `[identifiers]` are blanked in one lexer pass
+   (`ConvertTo-BareSql` in `HorizonSql.ps1`, also used for the runbook chips),
+   and the check fails closed.
+3. **Always rolled back:** the batch runs inside a transaction that is rolled
+   back whatever happens.
+4. **Effective permissions, reported every run.** The tool asks the database
+   what the identity it is running as could change, and prints
+   `Access: read-only: ... <login> as ro_query`. Anything else, a warning or a
+   `STOPPED`, means the setup is wrong; stop and fix it. `-CheckAccess` prints
+   the detail and stops.
+
+The tool takes no login or password parameter and connects with Windows
+authentication only, so a SQL login, such as the one KillBib uses, can never
+reach it. `Test-Tools.ps1` covers the refusal check, the access verdict and
+those constraints.
+
+**The one thing this does not cover:** a connection that does not go through
+this tool runs with the caller's own login. That is why `AGENTS.md` forbids
+every other route to the database.
+
+`ro_query`, like any database user, can still *read* the parts of `msdb` and
+`tempdb` that SQL Server opens to every user (backup history, for example).
+That is standard behaviour and read-only.
+
+### One-time setup: the `ro_query` user
+
+A maintainer with `sysadmin` (or `db_owner` plus `ALTER ANY USER`) runs this
+once per database, in SSMS. It creates a database user with **no login and no
+password**: nobody can sign in as it, and it exists only so the tool can switch
+to it. Replace `ILSDB`, and `staff_readers` with the Windows group (or user)
+your staff connect through. Logins that are already `sysadmin` need no grant.
+
+```sql
+-- 1. Check it is not there already (expect no rows).
+USE ILSDB;
+SELECT name, type_desc FROM sys.database_principals WHERE name = 'ro_query';
+
+-- 2. Create it: read-only, no login.
+CREATE USER ro_query WITHOUT LOGIN;
+ALTER ROLE db_datareader ADD MEMBER ro_query;
+GRANT IMPERSONATE ON USER::ro_query TO [staff_readers];
+```
+
+Prove it before relying on it. The `UPDATE` matches no rows, but SQL Server
+checks permission first, so it must fail with *"The UPDATE permission was
+denied on the object 'bib'"*:
+
+```sql
+USE ILSDB;
+EXECUTE AS USER = 'ro_query';
+SELECT USER_NAME() AS acting_as,                                   -- ro_query
+       HAS_PERMS_BY_NAME('dbo.bib', 'OBJECT', 'UPDATE') AS can_update; -- 0
+UPDATE bib SET tag = tag WHERE 1 = 0;                              -- must fail: permission denied
+REVERT;
+SELECT USER_NAME() AS back_to;                                     -- you again
+```
+
+To undo it: `DROP USER ro_query;`. The tool then stops with a message until
+the user is recreated; it never falls back to the caller's own login.
 
 ## `Get-SiteProfile.ps1`
 

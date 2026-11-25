@@ -109,6 +109,11 @@ Assert-Equal $true  (Test-IsWrite -Code 'GRANT SELECT ON dbo.x TO y;')          
 # These four all read as safe under a naive keyword allow-list.
 Assert-Equal $true  (Test-IsWrite -Code 'MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE;') 'MERGE is a write'
 Assert-Equal $true  (Test-IsWrite -Code 'SELECT a INTO dbo.NewTable FROM b;')               'SELECT ... INTO is a write'
+# A comment marker inside a string used to hide the write after it, giving the
+# runbook a READ-ONLY chip on SQL that deletes. Shared lexer: ConvertTo-BareSql.
+Assert-Equal $true  (Test-IsWrite -Code "SELECT '--' AS x; DELETE FROM bib;")               'write hidden after a -- inside a string is still a write'
+Assert-Equal $true  (Test-IsWrite -Code "SELECT '/*' AS a; DELETE FROM bib; SELECT '*/' AS b;") 'write between /* and */ in strings is still a write'
+Assert-Equal $true  (Test-IsWrite -Code "SELECT 'unterminated")                              'unparseable SQL fails closed'
 Assert-Equal $true  (Test-IsWrite -Code 'EXEC sp_rename ''a'', ''b'';')                     'EXEC is a write'
 Assert-Equal $true  (Test-IsWrite -Code ';WITH c AS (SELECT 1 x) UPDATE t SET y = 1;')      'CTE fronting an UPDATE is a write'
 
@@ -290,9 +295,18 @@ try {
 # ---------------------------------------------------------------------------
 Group 'Generators run against the real repo'
 
-$gen = & powershell -ExecutionPolicy Bypass -File (Join-Path $toolsDir 'Build-SolutionDocs.ps1') 2>&1
-Assert-True ($LASTEXITCODE -eq 0) 'Build-SolutionDocs exits 0'
-Assert-True (($gen -join "`n") -match 'sql file\(s\)') 'Build-SolutionDocs reports generated files'
+# Built into a throwaway copy, never in place: rewriting the tracked sql/ and
+# runbook.html files leaves a clone with "modified" files (line endings alone
+# are enough), and then `git pull` refuses to run - which broke the cataloger's
+# daily routine in the 2026-11-25 walkthrough.
+$genRoot = Join-Path $env:TEMP ("bsd-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $genRoot | Out-Null
+try {
+    Copy-Item (Join-Path $repoRoot 'solutions') $genRoot -Recurse
+    $gen = & powershell -ExecutionPolicy Bypass -File (Join-Path $toolsDir 'Build-SolutionDocs.ps1') -RepoRoot $genRoot 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'Build-SolutionDocs exits 0'
+    Assert-True (($gen -join "`n") -match 'sql file\(s\)') 'Build-SolutionDocs reports generated files'
+} finally { Remove-Item -Recurse -Force $genRoot -ErrorAction SilentlyContinue }
 
 # The schema exports are each site's own and are absent from a fresh clone -
 # see SETUP.md step 2. Skipped with a note rather than failed, because "you have
@@ -361,6 +375,118 @@ $missing  = @($sqlFiles | Where-Object {
     ((Get-Content $_.FullName -TotalCount 8 -Encoding UTF8) -join "`n") -notmatch 'GENERATED from'
 })
 Assert-Equal 0 $missing.Count "all $($sqlFiles.Count) generated .sql files carry the GENERATED header"
+
+# ---------------------------------------------------------------------------
+Group 'Invoke-ReadOnlyQuery.ps1 refuses anything that is not a read'
+
+# Dot-sourcing loads the functions and returns before connecting.
+. (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')
+
+$reads = @(
+    "SELECT COUNT(*) FROM bib_control",
+    "WITH c AS (SELECT 1 AS n) SELECT n FROM c",
+    "DECLARE @d int; SET @d = DATEDIFF(day, '1970-01-01', '2026-10-26'); SELECT @d",
+    "-- will not UPDATE anything`nSELECT 'DELETE me' AS note",
+    "SELECT b.[bib#] FROM bib b WHERE b.text LIKE '%INSERT INTO%'",
+    "SELECT update_date, deleteFlag FROM t",
+    "SELECT [delete], ""update"" FROM t",
+    "SELECT 'it''s -- not a comment' AS a, 'and /* not */ this' AS b",
+    "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT COUNT(*) FROM item",
+    "SELECT text FROM bib WHERE text LIKE '%COMMIT%'",
+    "SELECT COUNT(*) FROM bib_control WHERE create_user = 'cataloger_jane'",
+    "SELECT * FROM location WHERE name LIKE '%LOC%'"
+)
+foreach ($s in $reads) {
+    $why = Test-ReadOnlySql -Code $s
+    Assert-True ($null -eq $why) "accepts: $($s -replace '\s+', ' ')" "refused: $why"
+}
+$writes = @(
+    "UPDATE bib SET text = text WHERE 1 = 0",
+    "SELECT 1; DELETE FROM bib WHERE 1 = 0",
+    "SELECT * INTO dbo.x FROM bib_control",
+    "WITH c AS (SELECT 1 AS n) UPDATE t SET n = 1",
+    "MERGE t USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+    "EXEC sp_who",
+    "sp_help bib",
+    "SELECT * FROM OPENROWSET('x','y','z')",
+    "CREATE TABLE dbo.x (a int)",
+    "GRANT SELECT ON bib TO public",
+    "SELECT 1`nGO`nSELECT 2",
+    "/* SELECT */ DROP TABLE dbo.x",
+    "TRUNCATE TABLE dbo.x",
+    # Found by review: a comment marker inside a string hid the write after it.
+    "SELECT '--' AS x; DELETE FROM bib WHERE 1 = 0",
+    "SELECT '/*' AS a; DELETE FROM bib WHERE 1 = 0; SELECT '*/' AS b",
+    # ...and a quote inside a comment must not open a string.
+    "SELECT 1 -- it's fine`nDELETE FROM bib WHERE 1 = 0",
+    # Nested block comments: the DELETE is outside both.
+    "SELECT 1 /* a /* b */ c */ ; DELETE FROM bib WHERE 1 = 0",
+    # The batch must not be able to end the always-rollback transaction.
+    "SELECT 1; COMMIT; SELECT 2",
+    "SELECT 1; ROLLBACK",
+    "BEGIN TRAN; SELECT 1",
+    # Locks that would outlive the statement inside the transaction.
+    "SELECT TOP 1 * FROM item WITH (TABLOCKX)",
+    "SELECT * FROM item WITH (UPDLOCK, HOLDLOCK)",
+    "SELECT 1; WAITFOR DELAY '00:09:00'",
+    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1",
+    # Unterminated constructs cannot be reasoned about.
+    "SELECT 'unterminated",
+    "SELECT 1 /* never closed",
+    # Unedited placeholders return a meaningless (usually 0) answer.
+    "SELECT COUNT(*) FROM bib_control bc WHERE bc.create_user = 'CATALOGER'",
+    "SELECT name FROM location WHERE location = 'LOC'"
+)
+foreach ($s in $writes) {
+    $why = Test-ReadOnlySql -Code $s
+    Assert-True ($null -ne $why) "refuses: $($s -replace '\s+', ' ')" "was accepted"
+}
+
+function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$tables=0,$procs=0,$db=0)
+    [pscustomobject]@{ login_name='DOMAIN\someone'; is_sysadmin=$sa; is_db_owner=$own; is_db_datawriter=$dw;
+                       is_db_ddladmin=$ddl; is_db_datareader=$dr; writable_tables=$tables;
+                       executable_procs=$procs; database_write_perms=$db } }
+$verdictCases = @(
+    @{ Args = @{};            ReadOnly = $true;  Label = 'db_datareader only' }
+    @{ Args = @{ sa = 1 };     ReadOnly = $false; Label = 'sysadmin' }
+    @{ Args = @{ own = 1 };    ReadOnly = $false; Label = 'db_owner' }
+    @{ Args = @{ dw = 1 };     ReadOnly = $false; Label = 'db_datawriter' }
+    @{ Args = @{ ddl = 1 };    ReadOnly = $false; Label = 'db_ddladmin' }
+    @{ Args = @{ tables = 1 }; ReadOnly = $false; Label = 'one writable table anywhere' }
+    @{ Args = @{ procs = 1 };  ReadOnly = $false; Label = 'one executable procedure' }
+    @{ Args = @{ db = 1 };     ReadOnly = $false; Label = 'database-level CREATE/ALTER' }
+)
+foreach ($vc in $verdictCases) {
+    $a = $vc.Args
+    $got = (Get-AccessVerdict -Row (New-AccessRow @a)).ReadOnly
+    Assert-Equal $vc.ReadOnly $got "access verdict: $($vc.Label) -> $(if ($vc.ReadOnly) { 'read-only' } else { 'can write' })"
+}
+$line = ConvertTo-CsvLine -Values @('a,b', 'say "hi"', [DBNull]::Value, 5)
+Assert-Equal '"a,b","say ""hi""","","5"' $line 'CSV lines quote every field, double embedded quotes, write NULL as empty'
+
+# No credential parameter: the tool must never be able to use a SQL login.
+$roqParams = (Get-Command (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')).Parameters.Keys
+Assert-True (-not ($roqParams | Where-Object { $_ -match '(?i)cred|password|user' })) 'Invoke-ReadOnlyQuery.ps1 takes no login or password'
+$roqText = Get-Content (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1') -Raw
+Assert-True ($roqText -match 'Integrated Security=SSPI' -and $roqText -notmatch '(?i)User ID=|Password=') 'Invoke-ReadOnlyQuery.ps1 connects with Windows authentication only'
+# The database-enforced layer: become ro_query, irreversibly, on an unpooled
+# connection, and stop (never fall back) if that fails.
+Assert-Equal "EXECUTE AS USER = 'ro_query' WITH NO REVERT;" $script:SwitchSql 'switches to ro_query WITH NO REVERT'
+Assert-True ($roqText -match 'Pooling=false') 'the switched connection is never pooled'
+Assert-True ($roqText -match '(?s)\$script:SwitchSql.*?catch \{.*?exit 5') 'a failed switch exits before running anything'
+
+$cfgDir = Join-Path $env:TEMP ("roq-cfg-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $cfgDir | Out-Null
+try {
+    Assert-Throws { Get-HorizonSiteConfig -Path (Join-Path $cfgDir 'missing.psd1') } 'missing site config throws with instructions' 'site.local.example.psd1'
+    $ph = Join-Path $cfgDir 'placeholder.psd1'
+    Copy-Item (Join-Path $toolsDir 'site.local.example.psd1') $ph
+    Assert-Throws { Get-HorizonSiteConfig -Path $ph } 'the unedited example config is refused' 'placeholder'
+} finally { Remove-Item -Recurse -Force $cfgDir }
+
+Assert-True (-not (& git -C $repoRoot ls-files 'tools/site.local.psd1')) 'tools/site.local.psd1 is not tracked'
+& git -C $repoRoot check-ignore -q 'tools/site.local.psd1'
+Assert-True ($LASTEXITCODE -eq 0) 'tools/site.local.psd1 is gitignored'
 
 # ---------------------------------------------------------------------------
 Group 'Redaction guard - no real site identifiers in tracked files'

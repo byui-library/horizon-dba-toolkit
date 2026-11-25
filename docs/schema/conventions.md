@@ -169,7 +169,7 @@ expressed, since they are not declared as foreign keys.
 
 Horizon's schema is, for practical purposes, primary-key-free. A handful of
 `PRIMARY KEY` constraints exist — typically on circulation tables — and that is
-all. [`site-profile.md`](site-profile.md#keys--and-the-pk_-trap) lists yours in
+all. [`site-profile.md`](site-profile.md#keys---and-the-pk_-trap) lists yours in
 full; it is a short list.
 
 ### The naming trap
@@ -241,10 +241,10 @@ for **display in audit output only** — never for the value actually stored.
 
 Two practical consequences of the 255-character limit and the control characters:
 
-1. **Long fields split across rows.** Horizon continues a long `245`, `520`, or
-   `590` into additional rows with an incremented `tagord`. Reassembly means
-   ordering by `tagord`; the `245$a` parser used across this repo deliberately
-   takes only the lowest-`tagord` segment, which truncates the rare long title.
+1. **Long fields live in `bib_longtext`, with `bib.text` NULL.** Display them
+   with `COALESCE(text, longtext)`; a `LIKE` on `bib.text` cannot match them.
+   Full rule and the check to run:
+   [AGENTS.md Rule 8](AGENTS.md#rule-8--marc-text-is-not-plain-text).
 2. **`FOR XML PATH` entitizes this column rather than failing on it.** The
    `CHAR(31)`/`CHAR(30)` delimiters come back as `&#x1F;` and `&#x1E;`, so the
    aggregate holds entity references where the delimiters were. It does **not**

@@ -3,7 +3,18 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with
 code in this repository. It applies equally to any other assistant; the
 tool-neutral schema rules live in
-[`docs/schema/AGENTS.md`](docs/schema/AGENTS.md).
+[`docs/schema/AGENTS.md`](docs/schema/AGENTS.md). The root
+[`AGENTS.md`](AGENTS.md) is the entry point for OpenAI Codex, set up for a
+cataloger. It adds hard rules: query only through
+`tools\Invoke-ReadOnlyQuery.ps1`, never run a delete, never commit. Keep the
+two files consistent when either changes.
+
+**Querying the live database:** use `tools\Invoke-ReadOnlyQuery.ps1`. It reads
+the server from the gitignored `tools\site.local.psd1` (template:
+`site.local.example.psd1`) and runs every batch as the read-only database user
+`ro_query` (one-time setup in `tools/README.md`). It also refuses write-shaped
+SQL and rolls back every batch. Look names up live through it before falling
+back to `horizon-schema/`.
 
 ## What this repository is
 
@@ -193,6 +204,10 @@ Traps already paid for:
 - Indexes named `PK_*` are **not primary keys**. Grain comes from *unique
   indexes*. The declared list for this site is in
   [`docs/schema/site-profile.md`](docs/schema/site-profile.md).
+- A field longer than 255 characters has **`bib.text` NULL**; the whole field is
+  in `bib_longtext` (unique on `bib#, tag, tagord`). Display with
+  `COALESCE(text, longtext)`, and remember a `LIKE` on `bib.text` cannot see it.
+  It is **not** split across `bib` rows, despite what older docs here said.
 - `ITEM_JUV`, `borrower_bak`, `tmp*`, `del*` and their local equivalents are
   scratch/backup tables, not Horizon's. They can look authoritative and hold
   stale data — and the reverse also happens, since Horizon ships some names that

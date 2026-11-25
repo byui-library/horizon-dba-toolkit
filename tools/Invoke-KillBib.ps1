@@ -125,6 +125,51 @@ function Show-OrphanDiagnostic {
     }
 }
 
+# --- run-time log ----------------------------------------------------------
+#
+# Records when each KillBib invocation started and finished, so a
+# point-in-time restore (RESTORE ... WITH STOPAT) can target the moment just
+# before the delete. The SERVER clock is recorded as well as this machine's,
+# because STOPAT is interpreted in the server's local time and the two clocks
+# need not agree.
+#
+# One file per delete-list table, appended to by every invocation - the trial,
+# the full run and any resume - in killbib-audit\, which .gitignore excludes.
+# Logging must never stop a delete or hide KillBib's output, so every failure
+# here is reported and swallowed.
+$script:RunLogPath = Join-Path (Join-Path (Split-Path -Parent $toolsDir) 'killbib-audit') "$Table-runs.log"
+
+function Get-ServerClock {
+    try {
+        $c = New-Conn
+        try {
+            # GETDATE/GETUTCDATE rather than SYSDATETIME: lowest common denominator.
+            return [string] (Invoke-HorizonScalar -Connection $c -Timeout 30 -Sql `
+                "SELECT CONVERT(varchar(23), GETDATE(), 121) + ' (UTC ' + CONVERT(varchar(23), GETUTCDATE(), 121) + ')';")
+        } finally { $c.Close() }
+    } catch {
+        return "unavailable: $($_.Exception.Message)"
+    }
+}
+
+function Write-RunLog {
+    <# One event = one write: the heading line, both clocks, then a blank line. #>
+    param([string] $Heading)
+    $lines = @(
+        $Heading
+        "        server_clock=$(Get-ServerClock)"
+        "        local_clock=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')"
+    )
+    if ($Heading.StartsWith('FINISH')) { $lines += '' }
+    try {
+        $dir = Split-Path -Parent $script:RunLogPath
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Add-Content -LiteralPath $script:RunLogPath -Value $lines -Encoding ASCII
+    } catch {
+        Write-Host "  (could not write run log: $($_.Exception.Message))" -ForegroundColor DarkGray
+    }
+}
+
 function Invoke-KillBibRun {
     param(
         [string] $Exe,
@@ -175,7 +220,14 @@ function Invoke-KillBibRun {
     # its console. Everything KillBib prints is still visible on screen, and the
     # audit record lives in killbib-audit\<table>-<stamp>.csv, written before
     # anything is deleted.
+    # Taken immediately before launch: the restore point is "just before this".
+    $range = if ($BeginBib -and $EndBib) { "/b$BeginBib /e$EndBib" } elseif ($BeginBib) { "/b$BeginBib" } else { "whole list" }
+    Write-RunLog ("START   {0,-8}  table={1}  expected={2}  range={3}  kill_mode={4}" -f `
+        $Label, $Table, $ExpectedRows, $range, $(if ($Brutal) { '/k' } else { 'default' }))
+    Write-Host "  start time recorded in $script:RunLogPath" -ForegroundColor DarkGray
+
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $code = $null
     Push-Location -LiteralPath $exeDir
     try {
         Write-Host "  KillBib may prompt for confirmation - answer it here." -ForegroundColor Yellow
@@ -184,8 +236,14 @@ function Invoke-KillBibRun {
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
+        $sw.Stop()
+        # In the finally, so a START is always paired with a FINISH - even when
+        # KillBib could not be launched at all. A lone START would read as a
+        # delete still in progress. No exit code means it never completed; the
+        # exception itself still propagates to the console.
+        $outcome = if ($null -eq $code) { 'DID NOT COMPLETE (launch failed or interrupted)' } else { "exit=$code" }
+        Write-RunLog ("FINISH  {0,-8}  {1}  elapsed={2:N1}s" -f $Label, $outcome, $sw.Elapsed.TotalSeconds)
     }
-    $sw.Stop()
     $pw = $null
     $args = $null
 

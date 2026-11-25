@@ -255,3 +255,65 @@ ORDER BY r.wait_time DESC;
         }
     }
 }
+
+function ConvertTo-BareSql {
+    <#
+    .SYNOPSIS
+        Blanks out string literals, comments and delimited identifiers in ONE
+        left-to-right pass, the way SQL Server's own lexer reads a batch.
+    .DESCRIPTION
+        Shared by every check that looks for keywords in SQL text: the runbook
+        READ-ONLY/WRITES chip (Build-SolutionDocs.ps1) and the refusal check in
+        Invoke-ReadOnlyQuery.ps1.
+
+        Separate regex passes are unsafe in either order. Strip comments first
+        and a '--' inside a string swallows the rest of the line, or a '/*' in
+        one string and '*/' in a later one swallow everything between them,
+        writes included. Strip strings first and a quote inside a comment does
+        the same. A single pass that knows which state it is in cannot be
+        fooled that way.
+
+        Strings become '', comments a space, [identifiers] and "identifiers"
+        [x], so a column named [delete] is not a keyword. Block comments nest,
+        as they do in T-SQL. Returns $null when a string, comment or identifier
+        is left unterminated: callers must then treat the batch as unsafe.
+    #>
+    param([string] $Code)
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0; $n = $Code.Length
+    while ($i -lt $n) {
+        $c  = $Code[$i]
+        $c2 = if ($i + 1 -lt $n) { $Code[$i + 1] } else { [char]0 }
+        if ($c -eq '-' -and $c2 -eq '-') {
+            while ($i -lt $n -and $Code[$i] -ne "`n") { $i++ }
+            [void] $sb.Append(' ')
+        } elseif ($c -eq '/' -and $c2 -eq '*') {
+            $depth = 1; $i += 2
+            while ($depth -gt 0) {
+                if ($i -ge $n) { return $null }
+                $pair = if ($i + 1 -lt $n) { $Code.Substring($i, 2) } else { '' }
+                if     ($pair -eq '/*') { $depth++; $i += 2 }
+                elseif ($pair -eq '*/') { $depth--; $i += 2 }
+                else   { $i++ }
+            }
+            [void] $sb.Append(' ')
+        } elseif ($c -eq "'" -or $c -eq '[' -or $c -eq '"') {
+            # Strings and both identifier styles share one rule: scan to the
+            # closing character, where a doubled closer is an escaped one.
+            $close = if ($c -eq '[') { ']' } else { $c }
+            $i++
+            while ($true) {
+                if ($i -ge $n) { return $null }
+                if ($Code[$i] -eq $close) {
+                    if ($i + 1 -lt $n -and $Code[$i + 1] -eq $close) { $i += 2; continue }
+                    $i++; break
+                }
+                $i++
+            }
+            [void] $sb.Append($(if ($c -eq "'") { " '' " } else { '[x]' }))
+        } else {
+            [void] $sb.Append($c); $i++
+        }
+    }
+    return $sb.ToString()
+}

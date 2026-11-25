@@ -63,13 +63,27 @@ SET text = CHAR(31)+'a'+@value+CHAR(30)
 SELECT '|a' + <parsed value> AS [readable]
 ```
 
-Because `text` is `varchar(255)`, **long fields are split across multiple rows**
-with an incremented `tagord`. A `520` summary routinely spans several rows; a
-`245` occasionally does. Reassembly means ordering by `tagord` — and note that
-`FOR XML PATH` will do it, but it **entitizes** the `CHAR(31)`/`CHAR(30)`
-delimiters as `&#x1F;`/`&#x1E;` rather than preserving them, while `STRING_AGG`
-is unavailable at this compatibility level. Shipping a detail query avoids both
-problems.
+Because `text` is `varchar(255)`, **a longer field is not stored here.** Its row
+keeps `tag` and `tagord`, `text` is **NULL**, and the whole field is in
+`bib_longtext.longtext`, keyed uniquely by `bib#, tag, tagord`. Read field text
+as:
+
+```sql
+SELECT COALESCE(b.text, CAST(l.longtext AS varchar(8000))) AS field_text
+FROM bib b
+LEFT JOIN bib_longtext l
+       ON l.[bib#] = b.[bib#] AND l.tag = b.tag AND l.tagord = b.tagord
+```
+
+A `LIKE` on `b.text` alone silently misses every long field; see
+[AGENTS.md Rule 8](../AGENTS.md#rule-8--marc-text-is-not-plain-text) for the
+check to run before trusting a filter.
+
+When you aggregate several tags into one cell, note that `FOR XML PATH`
+**entitizes** the `CHAR(31)`/`CHAR(30)` delimiters as `&#x1F;`/`&#x1E;` rather
+than preserving them, and `STRING_AGG` is unavailable at low compatibility
+levels. Replace the delimiters before aggregating, or ship a detail query with
+one row per tag.
 
 ## Targeting one of several same-`tag` rows
 
@@ -91,8 +105,8 @@ HAVING COUNT(*) = 2 AND MIN(text) = MAX(text)
 
 The title parser reused across this repo's reports locates the `$a` delimiter,
 takes text up to the next `CHAR(31)`/`CHAR(30)` or end of string, then strips one
-trailing ISBD punctuation mark (`/ : ; , = .`). It uses the **lowest `tagord`**
-segment, so a `245` split across rows truncates to its first segment.
+trailing ISBD punctuation mark (`/ : ; , = .`). Run it on
+`COALESCE(text, longtext)` as above, or a long `245` comes back NULL.
 
 Always attach it with `OUTER APPLY`, never `CROSS APPLY` — a record whose `245$a`
 cannot be parsed must still appear in the report rather than silently vanishing.
