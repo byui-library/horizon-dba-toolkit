@@ -42,6 +42,28 @@ asked. Explain why instead, and offer the allowed route.
    If it prints `REFUSED`, nothing reached the database. Rewrite the query as a
    pure `SELECT`; do not look for a way around the check.
 
+   **There is no read-only database login.** The tool connects as the
+   cataloger's own Windows login, and depending on that login's group
+   memberships the database may accept writes from it. Every run prints an
+   `Access:` line saying which. When it says the login **CAN change data**, the
+   tool's refusal check and rollback are the *only* protection, so these
+   routes are forbidden without exception, even for a "quick look":
+
+   - `sqlcmd`, `osql`, `bcp`, `Invoke-Sqlcmd`, or any `SqlServer`/`dbatools` cmdlet
+   - PowerShell or any other code that creates a `SqlConnection`, `OdbcConnection`
+     or `OleDbConnection`, or loads `System.Data.SqlClient` yourself
+   - `Invoke-DeleteListRun.ps1`, `Invoke-KillBib.ps1`, `Test-DeleteListPreflight.ps1`
+   - scripting SSMS, or writing a `.sql` file for the cataloger to run in SSMS
+     that contains anything but a `SELECT`
+
+   If a task seems to need one of these, stop and say so.
+
+   **The SQL login is off limits.** The cataloger also has a SQL Server login,
+   the one KillBib's credential prompt asks for. It can write. Never ask for
+   it, its password, or any other credential; never put one in a command, a
+   file or a connection string. The cataloger types it into KillBib's prompt
+   himself, and it goes nowhere else.
+
 2. **Never run anything that changes the catalog.** In particular, never run
    `tools\Invoke-DeleteListRun.ps1`, `tools\Invoke-KillBib.ps1` or
    `KillBib.exe`, not even with `-WhatIfOnly` or `-Trial`. Changes to Horizon
@@ -131,7 +153,7 @@ as the worked example.
 
 | Script | You may run it? |
 | --- | --- |
-| `tools\Invoke-ReadOnlyQuery.ps1` | **Yes.** It is your only way into the database. |
+| `tools\Invoke-ReadOnlyQuery.ps1` | **Yes.** It is your only way into the database. `-CheckAccess` reports what the login could do and runs nothing else. Run it at the start of a session. |
 | `tools\Test-Tools.ps1` | Yes. No database involved. |
 | `tools\Build-SolutionDocs.ps1` | Yes, after drafting a solution README. It writes only local files. |
 | `tools\New-Solution.ps1` | Yes, to scaffold a draft. Leave it uncommitted. |

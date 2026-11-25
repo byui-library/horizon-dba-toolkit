@@ -178,10 +178,17 @@ Read-only in three layers:
    check fails closed.
 2. **Always rolled back:** the batch runs inside a transaction that is rolled
    back whatever happens.
-3. **A `db_datareader`-only login.** That one is for IT to grant, and it is the
-   only layer that holds if someone bypasses the script.
+3. **The login's own permissions, reported every run.** There is no separate
+   read-only login; the tool connects as the caller's Windows login and asks
+   the database what that login could change. It prints `Access: read-only`
+   when the database itself would refuse a write, or a warning naming the
+   roles and grants that would let it write. `-CheckAccess` prints the detail
+   and stops.
 
-`Test-Tools.ps1` covers the first layer with accepted and refused samples.
+The tool takes no login or password parameter and connects with Windows
+authentication only, so a SQL login, such as the one KillBib uses, can never
+reach it. `Test-Tools.ps1` covers the refusal check, the access verdict and
+that constraint.
 
 ## `Get-SiteProfile.ps1`
 

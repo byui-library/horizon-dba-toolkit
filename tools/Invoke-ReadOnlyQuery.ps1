@@ -8,7 +8,7 @@
     person - queries the live catalog from this repository. It exists so that
     every query connects the same way and none of them can change data.
 
-    Three independent layers keep it read-only:
+    Layers that keep it read-only:
 
       1. The SQL is refused before it is sent if it contains any statement that
          writes (INSERT, UPDATE, DELETE, MERGE, CREATE, DROP, ALTER, GRANT,
@@ -18,9 +18,13 @@
       2. The batch runs inside a transaction that is ALWAYS rolled back, so a
          write that somehow passed layer 1 is undone before the connection
          closes.
-      3. The connection uses Windows authentication. Ask IT for a login that
-         holds only db_datareader; then the database itself refuses writes,
-         whatever the first two layers do.
+      3. The login's own database permissions. The connection uses the
+         caller's Windows login, and no separate read-only login exists. Every
+         run therefore REPORTS what that login could do: "read-only" when the
+         database itself would refuse a write (e.g. access only through a group
+         holding db_datareader), or a warning when it could write, in which
+         case layers 1 and 2 are the whole protection. -CheckAccess prints the
+         detail and runs nothing else.
 
     Connection details come from tools\site.local.psd1, which is gitignored.
     Copy tools\site.local.example.psd1 to create it. Real server and database
@@ -44,6 +48,10 @@
     Query timeout in seconds. Default 600.
 .PARAMETER ConfigPath
     Use a different site config file.
+.PARAMETER CheckAccess
+    Report what the connecting Windows login is allowed to do in the database
+    (server role, database roles, write permissions on the core catalog
+    tables), then stop. Runs no query of yours.
 
 .EXAMPLE
     tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT COUNT(*) AS n FROM bib_control"
@@ -59,7 +67,8 @@ param(
     [string] $OutCsv,
     [int]    $MaxRows = 50,
     [int]    $Timeout = 600,
-    [string] $ConfigPath
+    [string] $ConfigPath,
+    [switch] $CheckAccess
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,21 +128,64 @@ function Test-ReadOnlySql {
     return $null
 }
 
+# What the connecting login could change, asked of the database itself.
+# HAS_PERMS_BY_NAME answers for the EFFECTIVE permission - group memberships,
+# role grants and DENYs all included - so it is right however access was given.
+$script:AccessSql = @"
+SELECT
+    SUSER_SNAME()                                              AS login_name,
+    IS_SRVROLEMEMBER('sysadmin')                               AS is_sysadmin,
+    ISNULL(IS_ROLEMEMBER('db_owner'), 0)                       AS is_db_owner,
+    ISNULL(IS_ROLEMEMBER('db_datawriter'), 0)                  AS is_db_datawriter,
+    ISNULL(IS_ROLEMEMBER('db_ddladmin'), 0)                    AS is_db_ddladmin,
+    ISNULL(IS_ROLEMEMBER('db_datareader'), 0)                  AS is_db_datareader,
+    ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'INSERT'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'UPDATE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'DELETE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib_control', 'OBJECT', 'UPDATE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib_control', 'OBJECT', 'DELETE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.item',        'OBJECT', 'UPDATE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME('dbo.item',        'OBJECT', 'DELETE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0)
+                                                               AS write_perms_found
+"@
+
+function Get-AccessVerdict {
+    <#
+        Turns one row of $AccessSql into (ReadOnly, Summary). Pure, so the
+        decision is testable offline. Any write permission, or any role that
+        implies one, means the database would accept a write.
+    #>
+    param($Row)
+    $reasons = @()
+    if ([int]$Row.is_sysadmin      -eq 1) { $reasons += 'sysadmin on the server' }
+    if ([int]$Row.is_db_owner      -eq 1) { $reasons += 'db_owner' }
+    if ([int]$Row.is_db_datawriter -eq 1) { $reasons += 'db_datawriter' }
+    if ([int]$Row.is_db_ddladmin   -eq 1) { $reasons += 'db_ddladmin' }
+    if ([int]$Row.write_perms_found -gt 0) { $reasons += "$($Row.write_perms_found) write permission(s) on bib/bib_control/item or CREATE TABLE" }
+    if ($reasons.Count -eq 0) {
+        return @{ ReadOnly = $true;  Summary = "read-only: the database itself refuses writes from $($Row.login_name)" }
+    }
+    return @{ ReadOnly = $false; Summary = "$($Row.login_name) CAN change data ($($reasons -join '; ')). Only this tool's checks and rollback prevent writes - never query any other way." }
+}
+
 # Lets Test-Tools.ps1 load the functions above without connecting anywhere.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 # --- input -----------------------------------------------------------------
-if ($File) {
-    if ($Sql) { throw "Give -Sql or -File, not both." }
-    $Sql = Get-Content -LiteralPath $File -Raw -Encoding UTF8
-}
-if (-not $Sql -or -not $Sql.Trim()) { throw "No query. Pass -Sql '<query>' or -File <path.sql>." }
+if (-not $CheckAccess) {
+    if ($File) {
+        if ($Sql) { throw "Give -Sql or -File, not both." }
+        $Sql = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+    }
+    if (-not $Sql -or -not $Sql.Trim()) { throw "No query. Pass -Sql '<query>' or -File <path.sql>." }
 
-$why = Test-ReadOnlySql -Code $Sql
-if ($why) {
-    Write-Host "REFUSED - nothing was sent to the database." -ForegroundColor Red
-    Write-Host "  The query $why" -ForegroundColor Red
-    exit 2
+    $why = Test-ReadOnlySql -Code $Sql
+    if ($why) {
+        Write-Host "REFUSED - nothing was sent to the database." -ForegroundColor Red
+        Write-Host "  The query $why" -ForegroundColor Red
+        exit 2
+    }
 }
 
 if (-not $ConfigPath) { $ConfigPath = Join-Path $toolsDir 'site.local.psd1' }
@@ -146,6 +198,26 @@ $conn = New-Object System.Data.SqlClient.SqlConnection $cs
 $ds = New-Object System.Data.DataSet
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $conn.Open()
+
+# Layer 3: report what this login could do, on every run.
+try {
+    $acmd = $conn.CreateCommand(); $acmd.CommandText = $script:AccessSql; $acmd.CommandTimeout = 30
+    $adt = New-Object System.Data.DataTable; $adt.Load($acmd.ExecuteReader())
+    $verdict = Get-AccessVerdict -Row $adt.Rows[0]
+} catch {
+    $verdict = @{ ReadOnly = $false; Summary = "could not determine this login's permissions ($($_.Exception.Message)) - assume it can write." }
+}
+if ($verdict.ReadOnly) {
+    Write-Host "Access: $($verdict.Summary)" -ForegroundColor DarkGray
+} else {
+    Write-Host "Access: $($verdict.Summary)" -ForegroundColor Yellow
+}
+if ($CheckAccess) {
+    $adt.Rows | Format-List | Out-String | Write-Host
+    $conn.Close()
+    exit 0
+}
+
 try {
     $tx = $conn.BeginTransaction()
     try {

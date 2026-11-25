@@ -400,6 +400,23 @@ foreach ($s in $writes) {
     Assert-True ($null -ne $why) "refuses: $($s -replace '\s+', ' ')" "was accepted"
 }
 
+function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$perms=0)
+    [pscustomobject]@{ login_name='DOMAIN\someone'; is_sysadmin=$sa; is_db_owner=$own; is_db_datawriter=$dw;
+                       is_db_ddladmin=$ddl; is_db_datareader=$dr; write_perms_found=$perms } }
+Assert-True ((Get-AccessVerdict -Row (New-AccessRow)).ReadOnly)            'db_datareader only -> read-only'
+Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -sa 1)).ReadOnly)  'sysadmin -> can write'
+Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -own 1)).ReadOnly) 'db_owner -> can write'
+Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -dw 1)).ReadOnly)  'db_datawriter -> can write'
+Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -ddl 1)).ReadOnly) 'db_ddladmin -> can write'
+Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -perms 1)).ReadOnly) 'one explicit write grant -> can write'
+Assert-True ($script:AccessSql -notmatch '(?i)\b(INSERT|UPDATE|DELETE)\s+(INTO|dbo|\w+\s+SET)') 'the access probe itself only asks, never writes'
+
+# No credential parameter: the tool must never be able to use a SQL login.
+$roqParams = (Get-Command (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')).Parameters.Keys
+Assert-True (-not ($roqParams | Where-Object { $_ -match '(?i)cred|password|user' })) 'Invoke-ReadOnlyQuery.ps1 takes no login or password'
+$roqText = Get-Content (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1') -Raw
+Assert-True ($roqText -match 'Integrated Security=SSPI' -and $roqText -notmatch '(?i)User ID=|Password=') 'Invoke-ReadOnlyQuery.ps1 connects with Windows authentication only'
+
 $cfgDir = Join-Path $env:TEMP ("roq-cfg-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $cfgDir | Out-Null
 try {

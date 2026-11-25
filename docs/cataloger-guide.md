@@ -20,11 +20,23 @@ review. See [What needs a person](#what-needs-a-person).
 About 30 minutes. Steps 1–3 may need IT if you cannot install software
 yourself.
 
-### 1. Ask IT for read access to the Horizon database
+### 1. Know your two database identities
 
-Your Windows (campus) login needs **read-only** access to the Horizon database:
-the `db_datareader` role and nothing more. Ask for exactly that, so the database
-itself refuses any change, whatever happens on your computer.
+You reach the Horizon database two ways, and they are kept apart on purpose:
+
+| Identity | Used by | Can it change data? |
+| --- | --- | --- |
+| Your **Windows login** | Codex, through `tools\Invoke-ReadOnlyQuery.ps1` | Depends on your group memberships. Step 5 checks. |
+| Your **SQL login** | KillBib only, when **you** type it into the delete wrapper's prompt | Yes |
+
+Codex never sees, asks for or uses the SQL login. If it ever asks for a
+password, refuse and tell the maintainer.
+
+There is no separate read-only login. So the toolkit guards your Windows login
+itself: every query is checked and refused if it would change anything, and
+whatever runs is rolled back. Every result also starts with an `Access:` line
+that says whether the database would have refused a change from your login
+anyway.
 
 ### 2. Install the software
 
@@ -65,11 +77,30 @@ holds a private handoff note for any job you are taking over.
 
 Open the Codex panel in VS Code and type:
 
-> Run the tool tests, then check the database connection by counting the rows
-> in bib_control.
+> Run the tool tests, then run the access check, then count the rows in
+> bib_control.
 
-You should see `... passed, 0 failed` and then a count. If not, see
-[Troubleshooting](#troubleshooting).
+You should see `... passed, 0 failed`, an `Access:` line, and a count. If not,
+see [Troubleshooting](#troubleshooting).
+
+**Send the maintainer the `Access:` line from that first run.**
+
+- `read-only: the database itself refuses writes from ...`: you reach the
+  database only through a read-only group. That's the best case.
+- `... CAN change data (...)`: your login belongs to a group with write or
+  admin rights. That is fine for reports, because the toolkit still refuses and
+  rolls back every write. But it means the toolkit's rules are the only
+  safeguard, so the maintainer may want to review your group memberships.
+
+### 6. Keep Codex asking before it runs commands
+
+In the Codex settings, keep the approval mode that **asks before running a
+command**; don't switch to full auto. Approve a command when it runs
+`tools\Invoke-ReadOnlyQuery.ps1`, `tools\Test-Tools.ps1` or
+`tools\Build-SolutionDocs.ps1`. **Decline anything else that touches the
+database**: `sqlcmd`, `Invoke-Sqlcmd`, a script that builds its own connection,
+or any delete command. Its rules forbid those, so a request for one means
+something has gone wrong. Tell the maintainer.
 
 ---
 
@@ -139,7 +170,7 @@ deciding that is a judgment call for a person.
 | --- | --- | --- |
 | `cannot be loaded because running scripts is disabled` | Windows is blocking PowerShell scripts | Ask Codex to run it with `powershell -ExecutionPolicy Bypass -File ...`. That is the form `AGENTS.md` tells it to use. |
 | `No site config at ...` | `site.local.psd1` is not in `tools\` | Repeat [step 4](#4-add-your-private-files). |
-| `Login failed for user ...` | Your Windows login has no access to the database yet | [Step 1](#1-ask-it-for-read-access-to-the-horizon-database): ask IT. |
+| `Login failed for user ...` | Your Windows login has no access to the database yet | Ask the maintainer to check which group grants database access. |
 | `REFUSED - nothing was sent to the database` | The query tried to change something | Nothing happened. Codex should rewrite it as a read-only query. |
 | Codex asks permission to run a command | Codex's own safety prompt | Read what it wants to run. Approve reads; never approve a delete command it proposes to run itself. |
 | A title or note comes back blank | That field is over 255 characters and stored separately | Tell Codex: "long fields are in bib_longtext". The rules already say so, but it is worth the reminder. |
@@ -153,8 +184,14 @@ deciding that is a judgment call for a person.
   `tools\.redaction-denylist.txt`. Neither is tracked.
 - Codex's rules: [`AGENTS.md`](../AGENTS.md). Claude Code's:
   [`CLAUDE.md`](../CLAUDE.md). Change them together.
-- The read-only guarantee rests on three layers: the refusal check in
-  `Invoke-ReadOnlyQuery.ps1`, the always-rolled-back transaction, and a
-  `db_datareader`-only login. The first two are tested by `Test-Tools.ps1`. The
-  third depends on IT, and it is the only one that holds if someone bypasses
-  the script.
+- There is no read-only login. Reads use the cataloger's Windows login; the
+  refusal check and the always-rolled-back transaction in
+  `Invoke-ReadOnlyQuery.ps1` are what stop a write, and both are tested by
+  `Test-Tools.ps1`. Whether the *database* would also refuse depends on his
+  groups; the `Access:` line reports it. At the reference site, the library
+  staff group held only `db_datareader`, while two admin groups were
+  `sysadmin`. A `DENY` cannot restrain a `sysadmin`; only leaving that group
+  can.
+- Nothing stops Codex from bypassing the script except its rules in
+  `AGENTS.md` and the cataloger approving commands. That is why the guide asks
+  him to keep command approval on.
