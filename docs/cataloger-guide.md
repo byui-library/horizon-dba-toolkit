@@ -184,14 +184,10 @@ deciding that is a judgment call for a person.
   `tools\.redaction-denylist.txt`. Neither is tracked.
 - Codex's rules: [`AGENTS.md`](../AGENTS.md). Claude Code's:
   [`CLAUDE.md`](../CLAUDE.md). Change them together.
-- There is no read-only login. Reads use the cataloger's Windows login; the
-  refusal check and the always-rolled-back transaction in
-  `Invoke-ReadOnlyQuery.ps1` are what stop a write, and both are tested by
-  `Test-Tools.ps1`. Whether the *database* would also refuse depends on his
-  groups; the `Access:` line reports it. At the reference site, the library
-  staff group held only `db_datareader`, while two admin groups were
-  `sysadmin`. A `DENY` cannot restrain a `sysadmin`; only leaving that group
-  can.
+- How reads are kept read-only without a read-only login:
+  [`tools/README.md`, `Invoke-ReadOnlyQuery.ps1`](../tools/README.md#invoke-readonlyqueryps1).
+  If his `Access:` line warns, check his Windows groups: a `DENY` cannot
+  restrain a `sysadmin`; only leaving that group can.
 - Nothing stops Codex from bypassing the script except its rules in
   `AGENTS.md` and the cataloger approving commands. That is why the guide asks
   him to keep command approval on.

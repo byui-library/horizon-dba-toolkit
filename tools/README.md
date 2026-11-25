@@ -173,9 +173,12 @@ Read-only in three layers:
 
 1. **Refused before sending** if the batch contains a write (`INSERT`,
    `UPDATE`, `DELETE`, `MERGE`, DDL, `GRANT`, `EXEC`, `SELECT ... INTO`, ...),
-   an external data source, a `GO`, or does not start with `SELECT`, `WITH`,
-   `DECLARE` or `SET`. Comments and string literals are stripped first, and the
-   check fails closed.
+   anything that could end the transaction (`COMMIT`, `ROLLBACK`), a lock hint
+   or `WAITFOR` that would hold locks until the rollback, an external data
+   source, a `GO`, or does not start with `SELECT`, `WITH`, `DECLARE` or `SET`.
+   Strings, comments and `[identifiers]` are blanked in one lexer pass
+   (`ConvertTo-BareSql` in `HorizonSql.ps1`, also used for the runbook chips),
+   and the check fails closed.
 2. **Always rolled back:** the batch runs inside a transaction that is rolled
    back whatever happens.
 3. **The login's own permissions, reported every run.** There is no separate

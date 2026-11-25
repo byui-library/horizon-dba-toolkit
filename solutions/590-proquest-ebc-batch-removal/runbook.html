@@ -284,7 +284,7 @@ ORDER BY bc.[bib#];</code></pre>
   </div>
   <div class="codewrap">
     <div class="codebar"><span class="codelabel">2a. Dry run</span><button class="copy">Copy</button></div>
-    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -Brutal -WhatIfOnly</code></pre>
+    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -Brutal -WhatIfOnly</code></pre>
   </div>
 </section>
 <section class="step">
@@ -297,7 +297,7 @@ ORDER BY bc.[bib#];</code></pre>
   </div>
   <div class="codewrap">
     <div class="codebar"><span class="codelabel">2b. The run</span><button class="copy">Copy</button></div>
-    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -StaffPrincipal staff_readers -Brutal -Trial</code></pre>
+    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -StaffPrincipal staff_readers -Brutal -Trial</code></pre>
   </div>
 </section>
 <section class="step">
@@ -310,7 +310,7 @@ ORDER BY bc.[bib#];</code></pre>
   </div>
   <div class="codewrap">
     <div class="codebar"><span class="codelabel">2b. The run</span><button class="copy">Copy</button></div>
-    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-KillBib.ps1" -Table PQ_EBC_20261026_DeleteList -ExpectedRows 2470 -Brutal -SkipTrial -Force</code></pre>
+    <pre><code>&amp; "C:\path\to\repo\tools\Invoke-KillBib.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -ExpectedRows 2470 -HorizonUserId HZUSER -Location LOC -Brutal -SkipTrial -Force</code></pre>
   </div>
 </section>
 <section class="step">
@@ -409,12 +409,12 @@ FROM (
         ORDER BY n.tagord
         FOR XML PATH('')
     ), 1, 4, ''), '&amp;lt;', '&lt;'), '&amp;gt;', '&gt;'), '&amp;amp;', '&amp;') AS [590_fields]
-FROM (
-    SELECT DISTINCT b.[bib#]
-    FROM bib b
-    WHERE b.tag = '035'
-      AND b.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%'
-) r
+FROM bib_control r
+WHERE EXISTS (
+        SELECT 1 FROM bib e
+        WHERE e.[bib#] = r.[bib#]
+          AND e.tag = '035'
+          AND e.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%')
 ORDER BY r.[bib#];</code></pre>
   </div>
 </section>

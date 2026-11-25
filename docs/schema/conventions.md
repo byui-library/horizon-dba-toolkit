@@ -241,12 +241,9 @@ for **display in audit output only** — never for the value actually stored.
 
 Two practical consequences of the 255-character limit and the control characters:
 
-1. **Long fields live in `bib_longtext`.** A field longer than 255 characters
-   keeps its `bib` row (`tag`, `tagord`) with `text` NULL, and the whole field
-   is stored in `bib_longtext.longtext`, keyed uniquely by `bib#, tag, tagord`.
-   Display it with `COALESCE(text, longtext)`, and remember that a `LIKE` on
-   `bib.text` cannot match it. *Corrected 2026-11-25*: this item used to say
-   long fields were split across `bib` rows. See
+1. **Long fields live in `bib_longtext`, with `bib.text` NULL.** Display them
+   with `COALESCE(text, longtext)`; a `LIKE` on `bib.text` cannot match them.
+   Full rule and the check to run:
    [AGENTS.md Rule 8](AGENTS.md#rule-8--marc-text-is-not-plain-text).
 2. **`FOR XML PATH` entitizes this column rather than failing on it.** The
    `CHAR(31)`/`CHAR(30)` delimiters come back as `&#x1F;` and `&#x1E;`, so the

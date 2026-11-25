@@ -140,9 +140,8 @@ function Show-OrphanDiagnostic {
 $script:RunLogPath = Join-Path (Join-Path (Split-Path -Parent $toolsDir) 'killbib-audit') "$Table-runs.log"
 
 function Get-ServerClock {
-    param([System.Management.Automation.PSCredential] $Cred)
     try {
-        $c = New-HorizonConnection -Server $Server -Database $Database -Credential $Cred -AppName 'KillBib'
+        $c = New-Conn
         try {
             # GETDATE/GETUTCDATE rather than SYSDATETIME: lowest common denominator.
             return [string] (Invoke-HorizonScalar -Connection $c -Timeout 30 -Sql `
@@ -154,11 +153,18 @@ function Get-ServerClock {
 }
 
 function Write-RunLog {
-    param([string] $Line)
+    <# One event = one write: the heading line, both clocks, then a blank line. #>
+    param([string] $Heading)
+    $lines = @(
+        $Heading
+        "        server_clock=$(Get-ServerClock)"
+        "        local_clock=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')"
+    )
+    if ($Heading.StartsWith('FINISH')) { $lines += '' }
     try {
         $dir = Split-Path -Parent $script:RunLogPath
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Add-Content -LiteralPath $script:RunLogPath -Value $Line -Encoding ASCII
+        Add-Content -LiteralPath $script:RunLogPath -Value $lines -Encoding ASCII
     } catch {
         Write-Host "  (could not write run log: $($_.Exception.Message))" -ForegroundColor DarkGray
     }
@@ -216,16 +222,12 @@ function Invoke-KillBibRun {
     # anything is deleted.
     # Taken immediately before launch: the restore point is "just before this".
     $range = if ($BeginBib -and $EndBib) { "/b$BeginBib /e$EndBib" } elseif ($BeginBib) { "/b$BeginBib" } else { "whole list" }
-    $serverStart = Get-ServerClock -Cred $Cred
-    $localStart  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     Write-RunLog ("START   {0,-8}  table={1}  expected={2}  range={3}  kill_mode={4}" -f `
         $Label, $Table, $ExpectedRows, $range, $(if ($Brutal) { '/k' } else { 'default' }))
-    Write-RunLog ("        server_clock={0}" -f $serverStart)
-    Write-RunLog ("        local_clock={0}" -f $localStart)
-    Write-Host "  start time recorded: server $serverStart" -ForegroundColor DarkGray
-    Write-Host "  log: $script:RunLogPath" -ForegroundColor DarkGray
+    Write-Host "  start time recorded in $script:RunLogPath" -ForegroundColor DarkGray
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $code = $null
     Push-Location -LiteralPath $exeDir
     try {
         Write-Host "  KillBib may prompt for confirmation - answer it here." -ForegroundColor Yellow
@@ -234,15 +236,16 @@ function Invoke-KillBibRun {
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
+        $sw.Stop()
+        # In the finally, so a START is always paired with a FINISH - even when
+        # KillBib could not be launched at all. A lone START would read as a
+        # delete still in progress. No exit code means it never completed; the
+        # exception itself still propagates to the console.
+        $outcome = if ($null -eq $code) { 'DID NOT COMPLETE (launch failed or interrupted)' } else { "exit=$code" }
+        Write-RunLog ("FINISH  {0,-8}  {1}  elapsed={2:N1}s" -f $Label, $outcome, $sw.Elapsed.TotalSeconds)
     }
-    $sw.Stop()
     $pw = $null
     $args = $null
-
-    Write-RunLog ("FINISH  {0,-8}  exit={1}  elapsed={2:N1}s" -f $Label, $code, $sw.Elapsed.TotalSeconds)
-    Write-RunLog ("        server_clock={0}" -f (Get-ServerClock -Cred $Cred))
-    Write-RunLog ("        local_clock={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))
-    Write-RunLog ""
 
     Write-Host ""
     Write-Host ("-" * 62) -ForegroundColor DarkGray

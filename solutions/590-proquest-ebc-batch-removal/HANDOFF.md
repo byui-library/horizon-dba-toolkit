@@ -73,11 +73,8 @@ trial bib is gone in the Horizon client, then:
 Do **not** re-run the first command for the rest: it would find 2,469 records,
 not 2,470, and abort.
 
-Both commands record their start and finish times, by the server's clock and
-yours, in `killbib-audit\PQ_EBC_20261026_DeleteList-runs.log`. The server's
-start time is the restore point if the delete ever has to be undone. The
-database runs in full recovery with hourly log backups, so a point-in-time
-restore to a side copy is possible.
+Both commands log their start and finish times; see README
+[Step 2b](README.md#2b-the-run) for where, and why that is the restore point.
 
 ### 3. Verify (Codex can do this)
 

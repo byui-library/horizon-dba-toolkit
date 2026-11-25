@@ -79,10 +79,6 @@ A `LIKE` on `b.text` alone silently misses every long field; see
 [AGENTS.md Rule 8](../AGENTS.md#rule-8--marc-text-is-not-plain-text) for the
 check to run before trusting a filter.
 
-> **Corrected 2026-11-25.** This page said long fields were split across several
-> `bib` rows with consecutive `tagord`s. A live database showed otherwise: the
-> field moves wholesale to `bib_longtext`.
-
 When you aggregate several tags into one cell, note that `FOR XML PATH`
 **entitizes** the `CHAR(31)`/`CHAR(30)` delimiters as `&#x1F;`/`&#x1E;` rather
 than preserving them, and `STRING_AGG` is unavailable at low compatibility

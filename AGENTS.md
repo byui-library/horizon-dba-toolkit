@@ -110,7 +110,7 @@ The traps that matter most, in brief. The documents above have the detail.
 | `bib` is one row per **tag**, `item` one per **copy** | Never join them directly. Test conditions with `EXISTS`; collapse with `DISTINCT` or aggregation. |
 | `bib.text` uses `CHAR(31)` (subfield) and `CHAR(30)` (end of field) | Display as `\|a…` only in output. Never write pipes into data. |
 | Fields over 255 characters have `bib.text` **NULL** | The text is in `bib_longtext`. Display with `COALESCE`; check filters for misses. |
-| Dates are `smallint` day counts | `create_date = DATEDIFF(day, '<Epoch>', '2026-10-26')`, with `Epoch` taken from `site.local.psd1`. Never compare to a date literal. |
+| Dates are `smallint` day counts | `create_date = DATEDIFF(day, '<epoch>', '2026-10-26')`, with the epoch taken from [`site-profile.md`](docs/schema/site-profile.md#epoch). Never compare to a date literal. |
 | The collation is case-insensitive | Short uppercase codes (`DDA`, `EBC`) need `COLLATE Latin1_General_CS_AS`. |
 | The engine may be old | No `STRING_AGG`, `CONCAT`, `IIF`, `FORMAT` or `OFFSET/FETCH`. |
 | `PK_*` index names, `tmp*`, `del*`, `*_bak` tables | Not what they look like. Grain comes from unique indexes; scratch tables are not Horizon's. |

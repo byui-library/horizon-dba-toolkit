@@ -109,6 +109,11 @@ Assert-Equal $true  (Test-IsWrite -Code 'GRANT SELECT ON dbo.x TO y;')          
 # These four all read as safe under a naive keyword allow-list.
 Assert-Equal $true  (Test-IsWrite -Code 'MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE;') 'MERGE is a write'
 Assert-Equal $true  (Test-IsWrite -Code 'SELECT a INTO dbo.NewTable FROM b;')               'SELECT ... INTO is a write'
+# A comment marker inside a string used to hide the write after it, giving the
+# runbook a READ-ONLY chip on SQL that deletes. Shared lexer: ConvertTo-BareSql.
+Assert-Equal $true  (Test-IsWrite -Code "SELECT '--' AS x; DELETE FROM bib;")               'write hidden after a -- inside a string is still a write'
+Assert-Equal $true  (Test-IsWrite -Code "SELECT '/*' AS a; DELETE FROM bib; SELECT '*/' AS b;") 'write between /* and */ in strings is still a write'
+Assert-Equal $true  (Test-IsWrite -Code "SELECT 'unterminated")                              'unparseable SQL fails closed'
 Assert-Equal $true  (Test-IsWrite -Code 'EXEC sp_rename ''a'', ''b'';')                     'EXEC is a write'
 Assert-Equal $true  (Test-IsWrite -Code ';WITH c AS (SELECT 1 x) UPDATE t SET y = 1;')      'CTE fronting an UPDATE is a write'
 
@@ -374,7 +379,11 @@ $reads = @(
     "DECLARE @d int; SET @d = DATEDIFF(day, '1970-01-01', '2026-10-26'); SELECT @d",
     "-- will not UPDATE anything`nSELECT 'DELETE me' AS note",
     "SELECT b.[bib#] FROM bib b WHERE b.text LIKE '%INSERT INTO%'",
-    "SELECT update_date, deleteFlag FROM t"
+    "SELECT update_date, deleteFlag FROM t",
+    "SELECT [delete], ""update"" FROM t",
+    "SELECT 'it''s -- not a comment' AS a, 'and /* not */ this' AS b",
+    "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT COUNT(*) FROM item",
+    "SELECT text FROM bib WHERE text LIKE '%COMMIT%'"
 )
 foreach ($s in $reads) {
     $why = Test-ReadOnlySql -Code $s
@@ -393,23 +402,53 @@ $writes = @(
     "GRANT SELECT ON bib TO public",
     "SELECT 1`nGO`nSELECT 2",
     "/* SELECT */ DROP TABLE dbo.x",
-    "TRUNCATE TABLE dbo.x"
+    "TRUNCATE TABLE dbo.x",
+    # Found by review: a comment marker inside a string hid the write after it.
+    "SELECT '--' AS x; DELETE FROM bib WHERE 1 = 0",
+    "SELECT '/*' AS a; DELETE FROM bib WHERE 1 = 0; SELECT '*/' AS b",
+    # ...and a quote inside a comment must not open a string.
+    "SELECT 1 -- it's fine`nDELETE FROM bib WHERE 1 = 0",
+    # Nested block comments: the DELETE is outside both.
+    "SELECT 1 /* a /* b */ c */ ; DELETE FROM bib WHERE 1 = 0",
+    # The batch must not be able to end the always-rollback transaction.
+    "SELECT 1; COMMIT; SELECT 2",
+    "SELECT 1; ROLLBACK",
+    "BEGIN TRAN; SELECT 1",
+    # Locks that would outlive the statement inside the transaction.
+    "SELECT TOP 1 * FROM item WITH (TABLOCKX)",
+    "SELECT * FROM item WITH (UPDLOCK, HOLDLOCK)",
+    "SELECT 1; WAITFOR DELAY '00:09:00'",
+    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1",
+    # Unterminated constructs cannot be reasoned about.
+    "SELECT 'unterminated",
+    "SELECT 1 /* never closed"
 )
 foreach ($s in $writes) {
     $why = Test-ReadOnlySql -Code $s
     Assert-True ($null -ne $why) "refuses: $($s -replace '\s+', ' ')" "was accepted"
 }
 
-function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$perms=0)
+function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$tables=0,$procs=0,$db=0)
     [pscustomobject]@{ login_name='DOMAIN\someone'; is_sysadmin=$sa; is_db_owner=$own; is_db_datawriter=$dw;
-                       is_db_ddladmin=$ddl; is_db_datareader=$dr; write_perms_found=$perms } }
-Assert-True ((Get-AccessVerdict -Row (New-AccessRow)).ReadOnly)            'db_datareader only -> read-only'
-Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -sa 1)).ReadOnly)  'sysadmin -> can write'
-Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -own 1)).ReadOnly) 'db_owner -> can write'
-Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -dw 1)).ReadOnly)  'db_datawriter -> can write'
-Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -ddl 1)).ReadOnly) 'db_ddladmin -> can write'
-Assert-True (-not (Get-AccessVerdict -Row (New-AccessRow -perms 1)).ReadOnly) 'one explicit write grant -> can write'
-Assert-True ($script:AccessSql -notmatch '(?i)\b(INSERT|UPDATE|DELETE)\s+(INTO|dbo|\w+\s+SET)') 'the access probe itself only asks, never writes'
+                       is_db_ddladmin=$ddl; is_db_datareader=$dr; writable_tables=$tables;
+                       executable_procs=$procs; database_write_perms=$db } }
+$verdictCases = @(
+    @{ Args = @{};            ReadOnly = $true;  Label = 'db_datareader only' }
+    @{ Args = @{ sa = 1 };     ReadOnly = $false; Label = 'sysadmin' }
+    @{ Args = @{ own = 1 };    ReadOnly = $false; Label = 'db_owner' }
+    @{ Args = @{ dw = 1 };     ReadOnly = $false; Label = 'db_datawriter' }
+    @{ Args = @{ ddl = 1 };    ReadOnly = $false; Label = 'db_ddladmin' }
+    @{ Args = @{ tables = 1 }; ReadOnly = $false; Label = 'one writable table anywhere' }
+    @{ Args = @{ procs = 1 };  ReadOnly = $false; Label = 'one executable procedure' }
+    @{ Args = @{ db = 1 };     ReadOnly = $false; Label = 'database-level CREATE/ALTER' }
+)
+foreach ($vc in $verdictCases) {
+    $a = $vc.Args
+    $got = (Get-AccessVerdict -Row (New-AccessRow @a)).ReadOnly
+    Assert-Equal $vc.ReadOnly $got "access verdict: $($vc.Label) -> $(if ($vc.ReadOnly) { 'read-only' } else { 'can write' })"
+}
+$line = ConvertTo-CsvLine -Values @('a,b', 'say "hi"', [DBNull]::Value, 5)
+Assert-Equal '"a,b","say ""hi""","","5"' $line 'CSV lines quote every field, double embedded quotes, write NULL as empty'
 
 # No credential parameter: the tool must never be able to use a SQL login.
 $roqParams = (Get-Command (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')).Parameters.Keys

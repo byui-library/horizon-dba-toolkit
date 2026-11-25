@@ -5,42 +5,28 @@
 
 .DESCRIPTION
     The single way an AI assistant (Codex, Claude Code, or any other) - or a
-    person - queries the live catalog from this repository. It exists so that
-    every query connects the same way and none of them can change data.
+    person - queries the live catalog from this repository, so that every
+    query connects the same way and none of them can change data.
 
-    Layers that keep it read-only:
-
-      1. The SQL is refused before it is sent if it contains any statement that
-         writes (INSERT, UPDATE, DELETE, MERGE, CREATE, DROP, ALTER, GRANT,
-         TRUNCATE, EXEC, SELECT ... INTO, ...), calls an external data source,
-         or does not start with SELECT / WITH / DECLARE / SET. The check fails
-         CLOSED: anything it cannot positively accept is refused.
-      2. The batch runs inside a transaction that is ALWAYS rolled back, so a
-         write that somehow passed layer 1 is undone before the connection
-         closes.
-      3. The login's own database permissions. The connection uses the
-         caller's Windows login, and no separate read-only login exists. Every
-         run therefore REPORTS what that login could do: "read-only" when the
-         database itself would refuse a write (e.g. access only through a group
-         holding db_datareader), or a warning when it could write, in which
-         case layers 1 and 2 are the whole protection. -CheckAccess prints the
-         detail and runs nothing else.
+    In short: the batch is refused before sending if it could write, it runs
+    inside a transaction that is always rolled back, and every run reports
+    whether the connecting Windows login could write anyway. There is no
+    separate read-only login. Full description of each layer, and why:
+    tools\README.md, section "Invoke-ReadOnlyQuery.ps1".
 
     Connection details come from tools\site.local.psd1, which is gitignored.
-    Copy tools\site.local.example.psd1 to create it. Real server and database
-    names never appear in a tracked file.
-
-    Changing data is deliberately out of scope. Deletes go through
-    Invoke-DeleteListRun.ps1 / Invoke-KillBib.ps1, run by a person.
+    Copy tools\site.local.example.psd1 to create it. Windows authentication
+    only: this script takes no login or password, by design.
 
 .PARAMETER Sql
     The query text. Use -File instead for anything long.
 .PARAMETER File
     A .sql file to run - e.g. one of the generated solutions\*\sql\*.sql files.
 .PARAMETER OutCsv
-    Save every row of the first result set to this CSV (UTF-8, all fields
-    quoted, so commas in MARC text are safe). Catalog data: keep it under
-    "excel reports\" or killbib-audit\, both gitignored.
+    Stream every row of the first result set to this CSV (UTF-8 with BOM, every
+    field quoted, so commas in MARC text are safe and Excel opens it cleanly).
+    Catalog data: keep it under "excel reports\" or killbib-audit\, both
+    gitignored.
 .PARAMETER MaxRows
     How many rows to print to the console per result set. Default 50. The CSV
     always gets every row.
@@ -49,9 +35,8 @@
 .PARAMETER ConfigPath
     Use a different site config file.
 .PARAMETER CheckAccess
-    Report what the connecting Windows login is allowed to do in the database
-    (server role, database roles, write permissions on the core catalog
-    tables), then stop. Runs no query of yours.
+    Report what the connecting Windows login is allowed to do in the database,
+    then stop. Runs no query of yours.
 
 .EXAMPLE
     tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT COUNT(*) AS n FROM bib_control"
@@ -73,6 +58,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $toolsDir 'HorizonSql.ps1')    # ConvertTo-BareSql
 
 function Get-HorizonSiteConfig {
     <#
@@ -96,33 +82,46 @@ server and database. The file is gitignored, so the real names stay local.
     return $cfg
 }
 
+# Refusal rules, checked in order against the batch with strings, comments and
+# [identifiers] blanked out. {0} in a message is the text that matched. Adding
+# a rule is one line here plus a case in Test-Tools.ps1.
+$script:RefusalRules = @(
+    @{ P = '(?im)^\s*GO\s*$'
+       M = 'contains GO. Send one batch at a time - GO is an SSMS separator, not T-SQL.' }
+    @{ P = '(?i)\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|GRANT|REVOKE|DENY|TRUNCATE|EXEC|EXECUTE|BACKUP|RESTORE|DBCC|BULK|KILL|SHUTDOWN|RECONFIGURE|USE)\b'
+       M = 'contains {0}. This tool only reads; changes go through the delete tooling, run by a person.' }
+    # The always-rollback layer only holds if the batch cannot end the
+    # transaction itself.
+    @{ P = '(?i)\b(COMMIT|ROLLBACK|SAVE|BEGIN\s+(TRAN|TRANSACTION|DISTRIBUTED))\b'
+       M = 'contains {0}. Transactions are managed by this tool, which always rolls back.' }
+    # Every batch runs in a transaction, so a lock taken by a hint or a stricter
+    # isolation level lasts until the rollback - long enough to stall
+    # circulation on the live system.
+    @{ P = '(?i)\b(WAITFOR|TABLOCK|TABLOCKX|XLOCK|UPDLOCK|HOLDLOCK|PAGLOCK|SERIALIZABLE|REPEATABLEREAD|REPEATABLE\s+READ)\b'
+       M = 'contains {0}, which would hold locks on the live catalog. Remove it.' }
+    @{ P = '(?is)\bSELECT\b.*?\bINTO\b\s+[\[\w#@]'
+       M = 'contains SELECT ... INTO, which creates a table. Remove the INTO clause.' }
+    @{ P = '(?i)\b(OPENROWSET|OPENQUERY|OPENDATASOURCE|OPENXML|xp_\w+|sp_\w+)\b'
+       M = 'calls {0}, which is not allowed here.' }
+    @{ P = '(?i)\bSET\s+(LOCK_TIMEOUT|DEADLOCK_PRIORITY|CONTEXT_INFO|IDENTITY_INSERT)\b'
+       M = 'changes a session setting ({0}) this tool does not allow.' }
+)
+
 function Test-ReadOnlySql {
     <#
         Returns $null when the batch is acceptable, otherwise the reason it was
-        refused. Fails CLOSED. Comments and string literals are removed first,
-        so a keyword inside a note ('... UPDATE ...') does not count, and one
-        hidden in a comment cannot smuggle anything past the start-of-batch rule.
+        refused. Fails CLOSED: anything it cannot positively accept is refused.
     #>
     param([string] $Code)
-
-    $bare = $Code -replace '(?s)/\*.*?\*/', ' ' -replace '(?m)--[^\n]*', ' ' -replace "'(?:''|[^'])*'", " '' "
-
-    if ($bare -match '(?im)^\s*GO\s*$') {
-        return "contains GO. Send one batch at a time - GO is an SSMS separator, not T-SQL."
+    $bare = ConvertTo-BareSql -Code $Code
+    if ($null -eq $bare) {
+        return "has an unterminated string, comment or [identifier], so it cannot be checked."
     }
-    $m = [regex]::Match($bare, '(?i)\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|GRANT|REVOKE|DENY|TRUNCATE|EXEC|EXECUTE|BACKUP|RESTORE|DBCC|BULK|KILL|SHUTDOWN|RECONFIGURE|USE)\b')
-    if ($m.Success) { return "contains $($m.Value.ToUpper()). This tool only reads; changes go through the delete tooling, run by a person." }
-    if ($bare -match '(?is)\bSELECT\b.*?\bINTO\b\s+[\[\w#@]') {
-        return "contains SELECT ... INTO, which creates a table. Remove the INTO clause."
+    foreach ($r in $script:RefusalRules) {
+        $m = [regex]::Match($bare, $r.P)
+        if ($m.Success) { return ($r.M -f ($m.Value.ToUpper() -replace '\s+', ' ')) }
     }
-    $m = [regex]::Match($bare, '(?i)\b(OPENROWSET|OPENQUERY|OPENDATASOURCE|OPENXML|xp_\w+|sp_\w+)\b')
-    if ($m.Success) { return "calls $($m.Value), which is not allowed here." }
-    if ($bare -match '(?i)\bSET\s+(LOCK_TIMEOUT|DEADLOCK_PRIORITY|CONTEXT_INFO|IDENTITY_INSERT)\b') {
-        return "changes a session setting this tool does not allow."
-    }
-
-    $start = $bare.TrimStart(" `t`r`n;")
-    if ($start -notmatch '(?i)^(SELECT|WITH|DECLARE|SET)\b') {
+    if ($bare.TrimStart(" `t`r`n;") -notmatch '(?i)^(SELECT|WITH|DECLARE|SET)\b') {
         return "does not start with SELECT, WITH, DECLARE or SET. A bare procedure name runs it as a call."
     }
     return $null
@@ -131,42 +130,67 @@ function Test-ReadOnlySql {
 # What the connecting login could change, asked of the database itself.
 # HAS_PERMS_BY_NAME answers for the EFFECTIVE permission - group memberships,
 # role grants and DENYs all included - so it is right however access was given.
+# Every table and procedure is checked, not a sample: one writable table
+# anywhere (patron data included) is enough to make the login able to write.
 $script:AccessSql = @"
 SELECT
-    SUSER_SNAME()                                              AS login_name,
-    IS_SRVROLEMEMBER('sysadmin')                               AS is_sysadmin,
-    ISNULL(IS_ROLEMEMBER('db_owner'), 0)                       AS is_db_owner,
-    ISNULL(IS_ROLEMEMBER('db_datawriter'), 0)                  AS is_db_datawriter,
-    ISNULL(IS_ROLEMEMBER('db_ddladmin'), 0)                    AS is_db_ddladmin,
-    ISNULL(IS_ROLEMEMBER('db_datareader'), 0)                  AS is_db_datareader,
-    ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'INSERT'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'UPDATE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib',         'OBJECT', 'DELETE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib_control', 'OBJECT', 'UPDATE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.bib_control', 'OBJECT', 'DELETE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.item',        'OBJECT', 'UPDATE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME('dbo.item',        'OBJECT', 'DELETE'), 0)
-  + ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0)
-                                                               AS write_perms_found
+    SUSER_SNAME()                                AS login_name,
+    IS_SRVROLEMEMBER('sysadmin')                 AS is_sysadmin,
+    ISNULL(IS_ROLEMEMBER('db_owner'), 0)         AS is_db_owner,
+    ISNULL(IS_ROLEMEMBER('db_datawriter'), 0)    AS is_db_datawriter,
+    ISNULL(IS_ROLEMEMBER('db_ddladmin'), 0)      AS is_db_ddladmin,
+    ISNULL(IS_ROLEMEMBER('db_datareader'), 0)    AS is_db_datareader,
+    (SELECT COUNT(*) FROM (
+        SELECT QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) AS qn
+        FROM sys.tables) t
+      WHERE ISNULL(HAS_PERMS_BY_NAME(t.qn, 'OBJECT', 'INSERT'), 0)
+          + ISNULL(HAS_PERMS_BY_NAME(t.qn, 'OBJECT', 'UPDATE'), 0)
+          + ISNULL(HAS_PERMS_BY_NAME(t.qn, 'OBJECT', 'DELETE'), 0) > 0)
+                                                 AS writable_tables,
+    (SELECT COUNT(*) FROM (
+        SELECT QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) AS qn
+        FROM sys.procedures) p
+      WHERE ISNULL(HAS_PERMS_BY_NAME(p.qn, 'OBJECT', 'EXECUTE'), 0) = 1)
+                                                 AS executable_procs,
+    ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER'), 0)
+  + ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL'), 0)
+                                                 AS database_write_perms
 "@
 
 function Get-AccessVerdict {
     <#
-        Turns one row of $AccessSql into (ReadOnly, Summary). Pure, so the
-        decision is testable offline. Any write permission, or any role that
-        implies one, means the database would accept a write.
+        Turns one row of $AccessSql into @{ ReadOnly; Failed; Summary }. Pure,
+        so the decision is testable offline. Any write permission, or any role
+        that implies one, means the database would accept a write.
     #>
     param($Row)
     $reasons = @()
-    if ([int]$Row.is_sysadmin      -eq 1) { $reasons += 'sysadmin on the server' }
-    if ([int]$Row.is_db_owner      -eq 1) { $reasons += 'db_owner' }
-    if ([int]$Row.is_db_datawriter -eq 1) { $reasons += 'db_datawriter' }
-    if ([int]$Row.is_db_ddladmin   -eq 1) { $reasons += 'db_ddladmin' }
-    if ([int]$Row.write_perms_found -gt 0) { $reasons += "$($Row.write_perms_found) write permission(s) on bib/bib_control/item or CREATE TABLE" }
+    if ([int]$Row.is_sysadmin          -eq 1) { $reasons += 'sysadmin on the server' }
+    if ([int]$Row.is_db_owner          -eq 1) { $reasons += 'db_owner' }
+    if ([int]$Row.is_db_datawriter     -eq 1) { $reasons += 'db_datawriter' }
+    if ([int]$Row.is_db_ddladmin       -eq 1) { $reasons += 'db_ddladmin' }
+    if ([int]$Row.writable_tables      -gt 0) { $reasons += "can insert, update or delete in $($Row.writable_tables) table(s)" }
+    if ([int]$Row.executable_procs     -gt 0) { $reasons += "can execute $($Row.executable_procs) stored procedure(s)" }
+    if ([int]$Row.database_write_perms -gt 0) { $reasons += 'can create or alter objects in the database' }
     if ($reasons.Count -eq 0) {
-        return @{ ReadOnly = $true;  Summary = "read-only: the database itself refuses writes from $($Row.login_name)" }
+        return @{ ReadOnly = $true; Failed = $false
+                  Summary = "read-only: the database itself refuses writes from $($Row.login_name)" }
     }
-    return @{ ReadOnly = $false; Summary = "$($Row.login_name) CAN change data ($($reasons -join '; ')). Only this tool's checks and rollback prevent writes - never query any other way." }
+    return @{ ReadOnly = $false; Failed = $false
+              Summary = "$($Row.login_name) CAN change data ($($reasons -join '; ')). Only this tool's checks and rollback prevent writes - never query any other way." }
+}
+
+function ConvertTo-CsvLine {
+    <# One CSV line, every field quoted, embedded quotes doubled, NULL as empty. #>
+    param([object[]] $Values)
+    $parts = New-Object 'string[]' $Values.Count
+    for ($k = 0; $k -lt $Values.Count; $k++) {
+        $v = $Values[$k]
+        $s = if ($v -is [DBNull] -or $null -eq $v) { '' } else { [string]$v }
+        $parts[$k] = '"' + $s.Replace('"', '""') + '"'
+    }
+    return ($parts -join ',')
 }
 
 # Lets Test-Tools.ps1 load the functions above without connecting anywhere.
@@ -191,33 +215,37 @@ if (-not $CheckAccess) {
 if (-not $ConfigPath) { $ConfigPath = Join-Path $toolsDir 'site.local.psd1' }
 $cfg = Get-HorizonSiteConfig -Path $ConfigPath
 
-# --- run -------------------------------------------------------------------
+# --- connect, and report what this login could do -------------------------
 $cs = "Server=$($cfg.Server);Database=$($cfg.Database);Integrated Security=SSPI;" +
       "Application Name=ReadOnlyQuery;ApplicationIntent=ReadOnly;Connect Timeout=15"
 $conn = New-Object System.Data.SqlClient.SqlConnection $cs
-$ds = New-Object System.Data.DataSet
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
 $conn.Open()
 
-# Layer 3: report what this login could do, on every run.
+$adt = New-Object System.Data.DataTable
 try {
-    $acmd = $conn.CreateCommand(); $acmd.CommandText = $script:AccessSql; $acmd.CommandTimeout = 30
-    $adt = New-Object System.Data.DataTable; $adt.Load($acmd.ExecuteReader())
+    $acmd = $conn.CreateCommand(); $acmd.CommandText = $script:AccessSql; $acmd.CommandTimeout = 60
+    $adt.Load($acmd.ExecuteReader())
     $verdict = Get-AccessVerdict -Row $adt.Rows[0]
 } catch {
-    $verdict = @{ ReadOnly = $false; Summary = "could not determine this login's permissions ($($_.Exception.Message)) - assume it can write." }
+    $verdict = @{ ReadOnly = $false; Failed = $true
+                  Summary = "could not determine this login's permissions ($($_.Exception.Message)) - assume it can write." }
 }
-if ($verdict.ReadOnly) {
-    Write-Host "Access: $($verdict.Summary)" -ForegroundColor DarkGray
-} else {
-    Write-Host "Access: $($verdict.Summary)" -ForegroundColor Yellow
-}
+$color = if ($verdict.ReadOnly) { 'DarkGray' } else { 'Yellow' }
+Write-Host "Access: $($verdict.Summary)" -ForegroundColor $color
 if ($CheckAccess) {
-    $adt.Rows | Format-List | Out-String | Write-Host
+    if (-not $verdict.Failed) { $adt.Rows | Format-List | Out-String | Write-Host }
     $conn.Close()
-    exit 0
+    exit $(if ($verdict.Failed) { 1 } else { 0 })   # a failed check is never a pass
 }
 
+# --- run: stream results, always roll back ---------------------------------
+# Rows are read as they arrive rather than buffered, so a 250,000-row export
+# costs no more memory than a 10-row one. The console keeps only the first
+# -MaxRows rows of each result set; the CSV gets every row of the first.
+$sets = New-Object System.Collections.Generic.List[object]
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$rolledBack = $false
+$reader = $null; $writer = $null; $csvRows = $null
 try {
     $tx = $conn.BeginTransaction()
     try {
@@ -225,11 +253,51 @@ try {
         $cmd.Transaction    = $tx
         $cmd.CommandText    = $Sql
         $cmd.CommandTimeout = $Timeout
-        $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-        [void] $da.Fill($ds)
+        $reader = $cmd.ExecuteReader()
+        do {
+            $fc = $reader.FieldCount
+            if ($fc -eq 0) { continue }
+            # Unique, non-empty column names, so the console objects can be built.
+            $cols = New-Object 'string[]' $fc
+            for ($k = 0; $k -lt $fc; $k++) {
+                $name = $reader.GetName($k); if (-not $name) { $name = "Column$($k + 1)" }
+                while ($cols -contains $name) { $name += "_$($k + 1)" }
+                $cols[$k] = $name
+            }
+            if ($OutCsv -and $sets.Count -eq 0) {
+                $dir = Split-Path -Parent $OutCsv
+                if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                $writer = New-Object System.IO.StreamWriter($OutCsv, $false, (New-Object System.Text.UTF8Encoding $true))
+                $writer.WriteLine((ConvertTo-CsvLine -Values $cols))
+            }
+            $shown = New-Object System.Collections.Generic.List[object]
+            $count = 0
+            $vals = New-Object 'object[]' $fc
+            while ($reader.Read()) {
+                $count++
+                [void] $reader.GetValues($vals)
+                if ($writer) { $writer.WriteLine((ConvertTo-CsvLine -Values $vals)) }
+                if ($shown.Count -lt $MaxRows) {
+                    $o = [ordered]@{}
+                    for ($k = 0; $k -lt $fc; $k++) { $o[$cols[$k]] = $vals[$k] }
+                    $shown.Add([pscustomobject]$o)
+                }
+            }
+            if ($writer) { $writer.Dispose(); $writer = $null; $csvRows = $count }
+            $sets.Add(@{ Shown = $shown; Count = $count })
+        } while ($reader.NextResult())
     } finally {
+        if ($writer) { $writer.Dispose() }
+        if ($reader -and -not $reader.IsClosed) { $reader.Close() }
         # Always. Even a pure SELECT ends here, so nothing a batch did survives.
-        try { $tx.Rollback() } catch { }
+        # A transaction whose Connection is gone was ended by the batch itself -
+        # the refusal rules should make that impossible, so say so loudly.
+        if ($null -ne $tx.Connection) {
+            try { $tx.Rollback(); $rolledBack = $true }
+            catch { Write-Host "WARNING: rollback failed: $($_.Exception.Message)" -ForegroundColor Red }
+        } else {
+            Write-Host "WARNING: the batch ended the transaction itself, so it could not be rolled back. Tell the maintainer." -ForegroundColor Red
+        }
     }
 } finally {
     $conn.Close()
@@ -237,30 +305,23 @@ try {
 $sw.Stop()
 
 # --- output ----------------------------------------------------------------
-if ($ds.Tables.Count -eq 0) {
+if ($sets.Count -eq 0) {
     Write-Host ("No result set returned ({0:N1}s)." -f $sw.Elapsed.TotalSeconds) -ForegroundColor Yellow
-    exit 0
 }
-$i = 0
-foreach ($t in $ds.Tables) {
-    $i++
-    $label = if ($ds.Tables.Count -gt 1) { "Result set $i" } else { "Result" }
-    Write-Host ("{0}: {1} row(s), {2:N1}s" -f $label, $t.Rows.Count, $sw.Elapsed.TotalSeconds) -ForegroundColor Cyan
-    if ($t.Rows.Count -gt 0) {
-        $t.Rows | Select-Object -First $MaxRows -Property ($t.Columns | ForEach-Object { $_.ColumnName }) |
-            Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
-        if ($t.Rows.Count -gt $MaxRows) {
-            Write-Host "  ... $($t.Rows.Count - $MaxRows) more row(s) not shown. Use -OutCsv for all of them." -ForegroundColor DarkGray
+for ($s = 0; $s -lt $sets.Count; $s++) {
+    $label = if ($sets.Count -gt 1) { "Result set $($s + 1)" } else { "Result" }
+    $set = $sets[$s]
+    Write-Host ("{0}: {1} row(s), {2:N1}s" -f $label, $set.Count, $sw.Elapsed.TotalSeconds) -ForegroundColor Cyan
+    if ($set.Count -gt 0) {
+        $set.Shown | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
+        if ($set.Count -gt $set.Shown.Count) {
+            Write-Host "  ... $($set.Count - $set.Shown.Count) more row(s) not shown. Use -OutCsv for all of them." -ForegroundColor DarkGray
         }
     }
 }
-
-if ($OutCsv) {
-    $dir = Split-Path -Parent $OutCsv
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $t = $ds.Tables[0]
-    $t.Rows | Select-Object -Property ($t.Columns | ForEach-Object { $_.ColumnName }) |
-        Export-Csv -LiteralPath $OutCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "Saved $($t.Rows.Count) row(s) to $((Resolve-Path -LiteralPath $OutCsv).Path)" -ForegroundColor Green
+if ($OutCsv -and $null -ne $csvRows) {
+    Write-Host "Saved $csvRows row(s) to $((Resolve-Path -LiteralPath $OutCsv).Path)" -ForegroundColor Green
 }
-exit 0
+# Exit 3 when the rollback did not happen, so a caller that checks only the
+# exit code still sees it.
+exit $(if ($rolledBack) { 0 } else { 3 })

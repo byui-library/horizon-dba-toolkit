@@ -290,7 +290,7 @@ from 1a, and `2470` with the `bibs` count from 1c. A mismatch makes it abort,
 which is the point.
 
 ```text
-& "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -Brutal -WhatIfOnly
+& "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -Brutal -WhatIfOnly
 ```
 
 The table name is 26 characters, inside KillBib's 30-character limit
@@ -301,7 +301,7 @@ The table name is 26 characters, inside KillBib's 30-character limit
 **Backup taken? Query 4a run and its counts recorded?** Then:
 
 ```text
-& "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -StaffPrincipal staff_readers -Brutal -Trial
+& "C:\path\to\repo\tools\Invoke-DeleteListRun.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -CreateUser CATALOGER -CreateDate 2026-10-26 -ExpectedRows 2470 -NoteTag 590 -NoteTerm ProQuest -Epoch 1970-01-01 -StaffPrincipal staff_readers -Brutal -Trial
 ```
 
 The wrapper prompts for the Horizon User ID (`/r`) and location (`/l`), builds
@@ -312,7 +312,7 @@ Check the trial bib is gone in the client, then delete the rest by calling
 KillBib's wrapper directly against the list the first command built:
 
 ```text
-& "C:\path\to\repo\tools\Invoke-KillBib.ps1" -Table PQ_EBC_20261026_DeleteList -ExpectedRows 2470 -Brutal -SkipTrial -Force
+& "C:\path\to\repo\tools\Invoke-KillBib.ps1" -Server ILSSERVER -Database ILSDB -Table PQ_EBC_20261026_DeleteList -ExpectedRows 2470 -HorizonUserId HZUSER -Location LOC -Brutal -SkipTrial -Force
 ```
 
 Do **not** re-run `Invoke-DeleteListRun.ps1` for the second part. Its count gate
@@ -471,18 +471,20 @@ SELECT
         ORDER BY n.tagord
         FOR XML PATH('')
     ), 1, 4, ''), '&lt;', '<'), '&gt;', '>'), '&amp;', '&') AS [590_fields]
-FROM (
-    SELECT DISTINCT b.[bib#]
-    FROM bib b
-    WHERE b.tag = '035'
-      AND b.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%'
-) r
+FROM bib_control r
+WHERE EXISTS (
+        SELECT 1 FROM bib e
+        WHERE e.[bib#] = r.[bib#]
+          AND e.tag = '035'
+          AND e.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%')
 ORDER BY r.[bib#];
 ```
 
 **Row count check:** it must equal `ebc_035_and_proquest_590 + ebc_035_only`
-from the post-delete run of 4a. The `DISTINCT` derived table is what holds it
-to one row per bib. Without it, a record with two EBC `035`s would appear twice.
+from the post-delete run of 4a. Both queries start from `bib_control`, one row
+per record, and test the `035` with the same `EXISTS`. That keeps it to one row
+per bib even when a record has two EBC `035`s, and means a stray `bib` row with
+no `bib_control` parent cannot appear in one count but not the other.
 
 ### Saving it as CSV
 

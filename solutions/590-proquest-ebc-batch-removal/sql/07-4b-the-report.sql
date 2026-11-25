@@ -40,10 +40,10 @@ SELECT
         ORDER BY n.tagord
         FOR XML PATH('')
     ), 1, 4, ''), '&lt;', '<'), '&gt;', '>'), '&amp;', '&') AS [590_fields]
-FROM (
-    SELECT DISTINCT b.[bib#]
-    FROM bib b
-    WHERE b.tag = '035'
-      AND b.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%'
-) r
+FROM bib_control r
+WHERE EXISTS (
+        SELECT 1 FROM bib e
+        WHERE e.[bib#] = r.[bib#]
+          AND e.tag = '035'
+          AND e.text COLLATE Latin1_General_CS_AS LIKE '%EBC[0-9]%')
 ORDER BY r.[bib#];
