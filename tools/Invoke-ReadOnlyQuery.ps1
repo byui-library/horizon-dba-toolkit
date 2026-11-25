@@ -110,24 +110,44 @@ $script:RefusalRules = @(
        M = 'changes a session setting ({0}) this tool does not allow.' }
 )
 
+function Test-PlaceholderSql {
+    <#
+        The committed solutions use placeholders for site values (CLAUDE.md).
+        Run unedited, they return a plausible answer about nobody - usually 0,
+        which a post-delete check reads as success. Returns the reason, or $null.
+
+        Checked on the batch with COMMENTS removed (a placeholder left in an
+        example comment is harmless) but strings and identifiers kept:
+          - inside any string literal, also as part of a LIKE pattern
+            ('CATALOGER%'), for the value placeholders;
+          - as a bare or [bracketed] name, for the server/database ones.
+        Case-sensitive: the placeholders are written in capitals and real
+        logins at a site are not. 'LOC' is deliberately not checked - it is
+        only ever a KillBib argument, never SQL, and it can be a real code.
+    #>
+    param([string] $Code)
+    $text = ConvertTo-BareSql -Code $Code -CommentsOnly
+    if ($null -eq $text) { return $null }   # Test-ReadOnlySql refuses it anyway
+    $m = [regex]::Match($text, "'[^']*?\b(CATALOGER|OTHERUSER|HZUSER|ils_svc|staff_readers)\b[^']*'")
+    if (-not $m.Success) { $m = [regex]::Match($text, '\b(ILSSERVER|ILSDB)\b') }
+    if ($m.Success) {
+        return "still contains the placeholder $($m.Groups[1].Value). Replace it with the real value (the private handoff file lists them). A result from a placeholder is meaningless - it usually comes back 0."
+    }
+    return $null
+}
+
 function Test-ReadOnlySql {
     <#
         Returns $null when the batch is acceptable, otherwise the reason it was
         refused. Fails CLOSED: anything it cannot positively accept is refused.
     #>
     param([string] $Code)
-    # The committed solutions use placeholders for site values (CLAUDE.md).
-    # Run unedited, they return a plausible answer about nobody - usually 0,
-    # which a post-delete check reads as success. Case-sensitive, quoted and
-    # exact, so real values and ordinary text never trip it.
-    $m = [regex]::Match($Code, "'(CATALOGER|OTHERUSER|HZUSER|LOC|ILSSERVER|ILSDB|ils_svc|staff_readers)'")
-    if ($m.Success) {
-        return "still contains the placeholder $($m.Value). Replace it with the real value (the private handoff file lists them). A result from a placeholder is meaningless - it usually comes back 0."
-    }
     $bare = ConvertTo-BareSql -Code $Code
     if ($null -eq $bare) {
         return "has an unterminated string, comment or [identifier], so it cannot be checked."
     }
+    $why = Test-PlaceholderSql -Code $Code
+    if ($why) { return $why }
     foreach ($r in $script:RefusalRules) {
         $m = [regex]::Match($bare, $r.P)
         if ($m.Success) { return ($r.M -f ($m.Value.ToUpper() -replace '\s+', ' ')) }
@@ -146,6 +166,7 @@ function Test-ReadOnlySql {
 $script:AccessSql = @"
 SELECT
     ORIGINAL_LOGIN() + ' as ' + USER_NAME()      AS login_name,
+    USER_NAME()                                  AS acting_as,
     IS_SRVROLEMEMBER('sysadmin')                 AS is_sysadmin,
     ISNULL(IS_ROLEMEMBER('db_owner'), 0)         AS is_db_owner,
     ISNULL(IS_ROLEMEMBER('db_datawriter'), 0)    AS is_db_datawriter,
@@ -177,6 +198,7 @@ function Get-AccessVerdict {
     #>
     param($Row)
     $reasons = @()
+    if ($Row.acting_as -and $Row.acting_as -ne $script:ReadOnlyUser) { $reasons += "running as $($Row.acting_as), not $($script:ReadOnlyUser)" }
     if ([int]$Row.is_sysadmin          -eq 1) { $reasons += 'sysadmin on the server' }
     if ([int]$Row.is_db_owner          -eq 1) { $reasons += 'db_owner' }
     if ([int]$Row.is_db_datawriter     -eq 1) { $reasons += 'db_datawriter' }
@@ -241,7 +263,7 @@ $conn = New-Object System.Data.SqlClient.SqlConnection $cs
 try { $conn.Open() } catch {
     Write-Host "COULD NOT CONNECT to $($cfg.Server) / $($cfg.Database):" -ForegroundColor Red
     Write-Host "  $($_.Exception.InnerException.Message)$(if (-not $_.Exception.InnerException) { $_.Exception.Message })" -ForegroundColor Red
-    exit 4
+    exit 6
 }
 
 # Become the read-only user before anything else runs. No fallback: if the
@@ -273,7 +295,15 @@ Write-Host "Access: $($verdict.Summary)" -ForegroundColor $color
 if ($CheckAccess) {
     if (-not $verdict.Failed) { $adt.Rows | Format-List | Out-String | Write-Host }
     $conn.Close()
-    exit $(if ($verdict.Failed) { 1 } else { 0 })   # a failed check is never a pass
+    exit $(if ($verdict.ReadOnly) { 0 } else { 1 })   # only a confirmed read-only identity passes
+}
+# Enforced, not advisory: the batch never runs unless the database has just
+# confirmed this connection is ro_query and can change nothing.
+if (-not $verdict.ReadOnly) {
+    $conn.Close()
+    Write-Host "STOPPED - the access check did not confirm a read-only identity. Nothing was run." -ForegroundColor Red
+    Write-Host "  Tell the maintainer, with the Access line above." -ForegroundColor Red
+    exit 5
 }
 
 # --- run: stream results, always roll back ---------------------------------
@@ -282,7 +312,7 @@ if ($CheckAccess) {
 # -MaxRows rows of each result set; the CSV gets every row of the first.
 $sets = New-Object System.Collections.Generic.List[object]
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$rolledBack = $false
+$rolledBack = $false; $queryFailed = $false
 $reader = $null; $writer = $null; $csvRows = $null
 try {
     $tx = $conn.BeginTransaction()
@@ -324,32 +354,39 @@ try {
             if ($writer) { $writer.Dispose(); $writer = $null; $csvRows = $count }
             $sets.Add(@{ Shown = $shown; Count = $count })
         } while ($reader.NextResult())
+    } catch {
+        $queryFailed = $true
+        throw
     } finally {
         if ($writer) { $writer.Dispose() }
         if ($reader -and -not $reader.IsClosed) { $reader.Close() }
         # Always. Even a pure SELECT ends here, so nothing a batch did survives.
-        # A transaction whose Connection is gone was ended by the batch itself -
-        # the refusal rules should make that impossible, so say so loudly.
         if ($null -ne $tx.Connection) {
             try { $tx.Rollback(); $rolledBack = $true }
             catch { Write-Host "WARNING: rollback failed: $($_.Exception.Message)" -ForegroundColor Red }
+        } elseif ($queryFailed) {
+            # Severe errors and deadlocks make SQL Server roll back by itself.
+            $rolledBack = $true
         } else {
+            # A batch that succeeded yet ended the transaction itself got past
+            # the refusal rules - worth a maintainer's attention.
             Write-Host "WARNING: the batch ended the transaction itself, so it could not be rolled back. Tell the maintainer." -ForegroundColor Red
         }
     }
-} catch [System.Data.SqlClient.SqlException] {
+} catch {
     # A SQL error is an answer, not a crash: show SQL Server's own message,
-    # plainly, and exit 4. The rollback above has already run.
+    # plainly, and exit 4. Anything that is not a SQL error is a real fault.
+    $e = $_.Exception
+    while ($e -and -not ($e -is [System.Data.SqlClient.SqlException])) { $e = $e.InnerException }
+    if (-not $e) { throw }
     $conn.Close()
     Write-Host "SQL ERROR - the database rejected the query (nothing was changed):" -ForegroundColor Red
-    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
-    exit 4
-} catch [System.Management.Automation.MethodInvocationException] {
-    $inner = $_.Exception.InnerException
-    if (-not ($inner -is [System.Data.SqlClient.SqlException])) { throw }
-    $conn.Close()
-    Write-Host "SQL ERROR - the database rejected the query (nothing was changed):" -ForegroundColor Red
-    Write-Host "  $($inner.Message)" -ForegroundColor Red
+    Write-Host "  $($e.Message)" -ForegroundColor Red
+    # A CSV cut off mid-export looks complete when opened. Never leave one.
+    if ($OutCsv -and $null -eq $csvRows -and (Test-Path -LiteralPath $OutCsv)) {
+        Remove-Item -LiteralPath $OutCsv -Force
+        Write-Host "  The partly written $OutCsv was deleted." -ForegroundColor Red
+    }
     exit 4
 } finally {
     $conn.Close()
