@@ -26,17 +26,17 @@ You reach the Horizon database two ways, and they are kept apart on purpose:
 
 | Identity | Used by | Can it change data? |
 | --- | --- | --- |
-| Your **Windows login** | Codex, through `tools\Invoke-ReadOnlyQuery.ps1` | Depends on your group memberships. Step 5 checks. |
+| Your **Windows login** | Codex, through `tools\Invoke-ReadOnlyQuery.ps1` | **No.** The tool switches to a read-only identity, `ro_query`, before every query. |
 | Your **SQL login** | KillBib only, when **you** type it into the delete wrapper's prompt | Yes |
 
 Codex never sees, asks for or uses the SQL login. If it ever asks for a
 password, refuse and tell the maintainer.
 
-There is no separate read-only login. So the toolkit guards your Windows login
-itself: every query is checked and refused if it would change anything, and
-whatever runs is rolled back. Every result also starts with an `Access:` line
-that says whether the database would have refused a change from your login
-anyway.
+There is no separate read-only *login* to remember. Instead, the moment the
+query tool connects as you, it switches to a database identity, `ro_query`,
+that SQL Server only lets read, and it cannot switch back. Any attempt to
+change data is refused by the database itself. Every result starts with an
+`Access:` line confirming it.
 
 ### 2. Install the software
 
@@ -83,14 +83,14 @@ Open the Codex panel in VS Code and type:
 You should see `... passed, 0 failed`, an `Access:` line, and a count. If not,
 see [Troubleshooting](#troubleshooting).
 
-**Send the maintainer the `Access:` line from that first run.**
+**Check the `Access:` line.** It must read:
 
-- `read-only: the database itself refuses writes from ...`: you reach the
-  database only through a read-only group. That's the best case.
-- `... CAN change data (...)`: your login belongs to a group with write or
-  admin rights. That is fine for reports, because the toolkit still refuses and
-  rolls back every write. But it means the toolkit's rules are the only
-  safeguard, so the maintainer may want to review your group memberships.
+```text
+Access: read-only: the database itself refuses writes from <your login> as ro_query
+```
+
+If it says anything else, or the tool prints `STOPPED`, don't run queries.
+Send the maintainer the message.
 
 ### 6. Keep Codex asking before it runs commands
 
@@ -171,6 +171,7 @@ deciding that is a judgment call for a person.
 | `cannot be loaded because running scripts is disabled` | Windows is blocking PowerShell scripts | Ask Codex to run it with `powershell -ExecutionPolicy Bypass -File ...`. That is the form `AGENTS.md` tells it to use. |
 | `No site config at ...` | `site.local.psd1` is not in `tools\` | Repeat [step 4](#4-add-your-private-files). |
 | `Login failed for user ...` | Your Windows login has no access to the database yet | Ask the maintainer to check which group grants database access. |
+| `STOPPED - could not switch to the read-only user` | The read-only identity is missing, or you aren't allowed to use it | Nothing ran. Send the message to the maintainer. |
 | `REFUSED - nothing was sent to the database` | The query tried to change something | Nothing happened. Codex should rewrite it as a read-only query. |
 | Codex asks permission to run a command | Codex's own safety prompt | Read what it wants to run. Approve reads; never approve a delete command it proposes to run itself. |
 | A title or note comes back blank | That field is over 255 characters and stored separately | Tell Codex: "long fields are in bib_longtext". The rules already say so, but it is worth the reminder. |
@@ -184,10 +185,10 @@ deciding that is a judgment call for a person.
   `tools\.redaction-denylist.txt`. Neither is tracked.
 - Codex's rules: [`AGENTS.md`](../AGENTS.md). Claude Code's:
   [`CLAUDE.md`](../CLAUDE.md). Change them together.
-- How reads are kept read-only without a read-only login:
+- How reads are kept read-only, and the one-time `ro_query` setup:
   [`tools/README.md`, `Invoke-ReadOnlyQuery.ps1`](../tools/README.md#invoke-readonlyqueryps1).
-  If his `Access:` line warns, check his Windows groups: a `DENY` cannot
-  restrain a `sysadmin`; only leaving that group can.
+  A `STOPPED ... could not switch` message on his machine means `ro_query` is
+  missing, or the group he connects through has no `IMPERSONATE` grant on it.
 - Nothing stops Codex from bypassing the script except its rules in
   `AGENTS.md` and the cataloger approving commands. That is why the guide asks
   him to keep command approval on.

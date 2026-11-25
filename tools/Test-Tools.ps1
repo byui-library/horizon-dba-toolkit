@@ -469,6 +469,11 @@ $roqParams = (Get-Command (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')).Para
 Assert-True (-not ($roqParams | Where-Object { $_ -match '(?i)cred|password|user' })) 'Invoke-ReadOnlyQuery.ps1 takes no login or password'
 $roqText = Get-Content (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1') -Raw
 Assert-True ($roqText -match 'Integrated Security=SSPI' -and $roqText -notmatch '(?i)User ID=|Password=') 'Invoke-ReadOnlyQuery.ps1 connects with Windows authentication only'
+# The database-enforced layer: become ro_query, irreversibly, on an unpooled
+# connection, and stop (never fall back) if that fails.
+Assert-Equal "EXECUTE AS USER = 'ro_query' WITH NO REVERT;" $script:SwitchSql 'switches to ro_query WITH NO REVERT'
+Assert-True ($roqText -match 'Pooling=false') 'the switched connection is never pooled'
+Assert-True ($roqText -match '(?s)\$script:SwitchSql.*?catch \{.*?exit 5') 'a failed switch exits before running anything'
 
 $cfgDir = Join-Path $env:TEMP ("roq-cfg-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $cfgDir | Out-Null

@@ -11,8 +11,10 @@ two files consistent when either changes.
 
 **Querying the live database:** use `tools\Invoke-ReadOnlyQuery.ps1`. It reads
 the server from the gitignored `tools\site.local.psd1` (template:
-`site.local.example.psd1`), refuses writes, and rolls back every batch. Look
-names up live through it before falling back to `horizon-schema/`.
+`site.local.example.psd1`) and runs every batch as the read-only database user
+`ro_query` (one-time setup in `tools/README.md`). It also refuses write-shaped
+SQL and rolls back every batch. Look names up live through it before falling
+back to `horizon-schema/`.
 
 ## What this repository is
 

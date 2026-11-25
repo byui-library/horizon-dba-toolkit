@@ -8,11 +8,14 @@
     person - queries the live catalog from this repository, so that every
     query connects the same way and none of them can change data.
 
-    In short: the batch is refused before sending if it could write, it runs
-    inside a transaction that is always rolled back, and every run reports
-    whether the connecting Windows login could write anyway. There is no
-    separate read-only login. Full description of each layer, and why:
-    tools\README.md, section "Invoke-ReadOnlyQuery.ps1".
+    In short: after connecting with the caller's Windows login, the tool
+    switches - irreversibly, for that connection - to the database user
+    ro_query, which holds only db_datareader, so SQL Server itself refuses any
+    write. It refuses to run at all if that switch fails. On top of that, the
+    batch is refused before sending if it looks like a write, it runs inside a
+    transaction that is always rolled back, and every run reports what the
+    effective identity could change. Full description, and the one-time setup
+    that creates ro_query: tools\README.md, section "Invoke-ReadOnlyQuery.ps1".
 
     Connection details come from tools\site.local.psd1, which is gitignored.
     Copy tools\site.local.example.psd1 to create it. Windows authentication
@@ -142,7 +145,7 @@ function Test-ReadOnlySql {
 # anywhere (patron data included) is enough to make the login able to write.
 $script:AccessSql = @"
 SELECT
-    SUSER_SNAME()                                AS login_name,
+    ORIGINAL_LOGIN() + ' as ' + USER_NAME()      AS login_name,
     IS_SRVROLEMEMBER('sysadmin')                 AS is_sysadmin,
     ISNULL(IS_ROLEMEMBER('db_owner'), 0)         AS is_db_owner,
     ISNULL(IS_ROLEMEMBER('db_datawriter'), 0)    AS is_db_datawriter,
@@ -186,7 +189,7 @@ function Get-AccessVerdict {
                   Summary = "read-only: the database itself refuses writes from $($Row.login_name)" }
     }
     return @{ ReadOnly = $false; Failed = $false
-              Summary = "$($Row.login_name) CAN change data ($($reasons -join '; ')). Only this tool's checks and rollback prevent writes - never query any other way." }
+              Summary = "$($Row.login_name) CAN change data ($($reasons -join '; ')). The read-only user is not doing its job - stop and tell the maintainer." }
 }
 
 function ConvertTo-CsvLine {
@@ -200,6 +203,12 @@ function ConvertTo-CsvLine {
     }
     return ($parts -join ',')
 }
+
+# The database user every query runs as. Created once by the maintainer (setup
+# script in tools\README.md); db_datareader only, no login, no password.
+# WITH NO REVERT: the batch cannot switch back to the caller's own login.
+$script:ReadOnlyUser = 'ro_query'
+$script:SwitchSql    = "EXECUTE AS USER = '$($script:ReadOnlyUser)' WITH NO REVERT;"
 
 # Lets Test-Tools.ps1 load the functions above without connecting anywhere.
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -224,13 +233,30 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $toolsDir 'site.local.psd1' }
 $cfg = Get-HorizonSiteConfig -Path $ConfigPath
 
 # --- connect, and report what this login could do -------------------------
+# Pooling=false: a NO REVERT context cannot be reset, so the connection must
+# really close rather than return to a pool for some other caller.
 $cs = "Server=$($cfg.Server);Database=$($cfg.Database);Integrated Security=SSPI;" +
-      "Application Name=ReadOnlyQuery;ApplicationIntent=ReadOnly;Connect Timeout=15"
+      "Application Name=ReadOnlyQuery;ApplicationIntent=ReadOnly;Connect Timeout=15;Pooling=false"
 $conn = New-Object System.Data.SqlClient.SqlConnection $cs
 try { $conn.Open() } catch {
     Write-Host "COULD NOT CONNECT to $($cfg.Server) / $($cfg.Database):" -ForegroundColor Red
     Write-Host "  $($_.Exception.InnerException.Message)$(if (-not $_.Exception.InnerException) { $_.Exception.Message })" -ForegroundColor Red
     exit 4
+}
+
+# Become the read-only user before anything else runs. No fallback: if the
+# switch fails, nothing runs under the caller's own (possibly writable) login.
+try {
+    $scmd = $conn.CreateCommand(); $scmd.CommandText = $script:SwitchSql; $scmd.CommandTimeout = 30
+    [void] $scmd.ExecuteNonQuery()
+} catch {
+    $conn.Close()
+    $msg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+    Write-Host "STOPPED - could not switch to the read-only user '$($script:ReadOnlyUser)'. Nothing was run." -ForegroundColor Red
+    Write-Host "  $msg" -ForegroundColor Red
+    Write-Host "  Either the one-time setup has not been run in this database, or your login is not" -ForegroundColor Red
+    Write-Host "  allowed to switch to it. Ask the maintainer (tools\README.md, Invoke-ReadOnlyQuery.ps1)." -ForegroundColor Red
+    exit 5
 }
 
 $adt = New-Object System.Data.DataTable

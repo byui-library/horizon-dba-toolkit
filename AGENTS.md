@@ -42,12 +42,14 @@ asked. Explain why instead, and offer the allowed route.
    If it prints `REFUSED`, nothing reached the database. Rewrite the query as a
    pure `SELECT`; do not look for a way around the check.
 
-   **There is no read-only database login.** The tool connects as the
-   cataloger's own Windows login, and depending on that login's group
-   memberships the database may accept writes from it. Every run prints an
-   `Access:` line saying which. When it says the login **CAN change data**, the
-   tool's refusal check and rollback are the *only* protection, so these
-   routes are forbidden without exception, even for a "quick look":
+   **Why only this route.** The tool connects as the cataloger's own Windows
+   login, which may be able to write, and immediately switches to the
+   database user `ro_query`, which cannot. Every run prints an `Access:` line,
+   which must read `read-only ... as ro_query`. If it warns, or the tool prints
+   `STOPPED`, stop and tell the cataloger to contact the maintainer. Do not
+   work around it. Any *other* connection skips that switch and runs with the
+   cataloger's own rights, so these routes are forbidden without exception,
+   even for a "quick look":
 
    - `sqlcmd`, `osql`, `bcp`, `Invoke-Sqlcmd`, or any `SqlServer`/`dbatools` cmdlet
    - PowerShell or any other code that creates a `SqlConnection`, `OdbcConnection`
