@@ -277,8 +277,12 @@ function ConvertTo-BareSql {
         [x], so a column named [delete] is not a keyword. Block comments nest,
         as they do in T-SQL. Returns $null when a string, comment or identifier
         is left unterminated: callers must then treat the batch as unsafe.
+
+        -CommentsOnly removes comments but keeps strings and identifiers
+        verbatim - for checks that are about literal values (placeholders)
+        rather than keywords.
     #>
-    param([string] $Code)
+    param([string] $Code, [switch] $CommentsOnly)
     $sb = New-Object System.Text.StringBuilder
     $i = 0; $n = $Code.Length
     while ($i -lt $n) {
@@ -301,6 +305,7 @@ function ConvertTo-BareSql {
             # Strings and both identifier styles share one rule: scan to the
             # closing character, where a doubled closer is an escaped one.
             $close = if ($c -eq '[') { ']' } else { $c }
+            $start = $i
             $i++
             while ($true) {
                 if ($i -ge $n) { return $null }
@@ -310,7 +315,9 @@ function ConvertTo-BareSql {
                 }
                 $i++
             }
-            [void] $sb.Append($(if ($c -eq "'") { " '' " } else { '[x]' }))
+            if     ($CommentsOnly) { [void] $sb.Append($Code.Substring($start, $i - $start)) }
+            elseif ($c -eq "'")    { [void] $sb.Append(" '' ") }
+            else                   { [void] $sb.Append('[x]') }
         } else {
             [void] $sb.Append($c); $i++
         }

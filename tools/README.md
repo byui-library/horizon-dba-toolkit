@@ -189,16 +189,28 @@ others give friendlier errors and a second line of defence:
    and the check fails closed.
 3. **Always rolled back:** the batch runs inside a transaction that is rolled
    back whatever happens.
-4. **Effective permissions, reported every run.** The tool asks the database
-   what the identity it is running as could change, and prints
-   `Access: read-only: ... <login> as ro_query`. Anything else, a warning or a
-   `STOPPED`, means the setup is wrong; stop and fix it. `-CheckAccess` prints
-   the detail and stops.
+4. **Effective permissions, checked every run.** After the switch the tool
+   asks the database what the current identity could change, and prints
+   `Access: read-only: ... <login> as ro_query`. Unless that check confirms
+   `ro_query` with no write permission of any kind, the tool **stops** with
+   exit 5 before running the batch. `-CheckAccess` prints the detail and stops.
 
 The tool takes no login or password parameter and connects with Windows
 authentication only, so a SQL login, such as the one KillBib uses, can never
 reach it. `Test-Tools.ps1` covers the refusal check, the access verdict and
 those constraints.
+
+**Exit codes**, so an assistant can tell what happened without parsing text:
+
+| Code | Meaning | Anything run? |
+| ---: | --- | --- |
+| 0 | Success (for `-CheckAccess`: confirmed read-only) | yes, rolled back |
+| 1 | `-CheckAccess` did not confirm a read-only identity | no |
+| 2 | `REFUSED`: write-shaped SQL or an unedited placeholder | no |
+| 3 | Ran, but the rollback did not happen. Tell the maintainer. | yes |
+| 4 | `SQL ERROR`: SQL Server rejected the query. Any partial CSV is deleted. | rolled back |
+| 5 | `STOPPED`: could not switch to `ro_query`, or the access check did not confirm read-only | no |
+| 6 | Could not connect to the server | no |
 
 **The one thing this does not cover:** a connection that does not go through
 this tool runs with the caller's own login. That is why `AGENTS.md` forbids

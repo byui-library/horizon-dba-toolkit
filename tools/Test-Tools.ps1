@@ -306,6 +306,23 @@ try {
     $gen = & powershell -ExecutionPolicy Bypass -File (Join-Path $toolsDir 'Build-SolutionDocs.ps1') -RepoRoot $genRoot 2>&1
     Assert-True ($LASTEXITCODE -eq 0) 'Build-SolutionDocs exits 0'
     Assert-True (($gen -join "`n") -match 'sql file\(s\)') 'Build-SolutionDocs reports generated files'
+
+    # The committed sql/ and runbook.html must match a fresh build of their
+    # README, or a DBA runs SQL that no longer matches what was reviewed.
+    # Line endings are ignored: git may store them differently from the build.
+    $stale = @()
+    $built = Get-ChildItem (Join-Path $genRoot 'solutions') -Recurse -File |
+             Where-Object { $_.Name -eq 'runbook.html' -or $_.Directory.Name -eq 'sql' }
+    foreach ($b in $built) {
+        $rel = $b.FullName.Substring($genRoot.Length).TrimStart('\')
+        $tracked = Join-Path $repoRoot $rel
+        if (-not (Test-Path -LiteralPath $tracked)) { $stale += "$rel (not committed)"; continue }
+        $a = ([IO.File]::ReadAllText($b.FullName)) -replace "`r`n", "`n"
+        $t = ([IO.File]::ReadAllText($tracked))   -replace "`r`n", "`n"
+        if ($a -ne $t) { $stale += $rel }
+    }
+    if ($stale.Count -eq 0) { Ok "generated sql/ and runbook.html match their READMEs ($($built.Count) files)" }
+    else { Bad 'generated files are out of date - run tools\Build-SolutionDocs.ps1 and commit' ($stale -join '; ') }
 } finally { Remove-Item -Recurse -Force $genRoot -ErrorAction SilentlyContinue }
 
 # The schema exports are each site's own and are absent from a fresh clone -
@@ -394,7 +411,11 @@ $reads = @(
     "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT COUNT(*) FROM item",
     "SELECT text FROM bib WHERE text LIKE '%COMMIT%'",
     "SELECT COUNT(*) FROM bib_control WHERE create_user = 'cataloger_jane'",
-    "SELECT * FROM location WHERE name LIKE '%LOC%'"
+    "SELECT * FROM location WHERE name LIKE '%LOC%'",
+    # 'LOC' can be a real code; it is only ever a KillBib placeholder.
+    "SELECT name FROM location WHERE location = 'LOC'",
+    # A placeholder left in an example comment is harmless.
+    "-- e.g. create_user = 'CATALOGER'`nSELECT COUNT(*) FROM bib_control WHERE create_user = 'realuser'"
 )
 foreach ($s in $reads) {
     $why = Test-ReadOnlySql -Code $s
@@ -435,15 +456,17 @@ $writes = @(
     "SELECT 1 /* never closed",
     # Unedited placeholders return a meaningless (usually 0) answer.
     "SELECT COUNT(*) FROM bib_control bc WHERE bc.create_user = 'CATALOGER'",
-    "SELECT name FROM location WHERE location = 'LOC'"
+    "SELECT COUNT(*) FROM bib_control WHERE create_user LIKE 'CATALOGER%'",
+    "SELECT COUNT(*) FROM ILSDB.dbo.bib",
+    "SELECT COUNT(*) FROM [ILSDB].dbo.bib"
 )
 foreach ($s in $writes) {
     $why = Test-ReadOnlySql -Code $s
     Assert-True ($null -ne $why) "refuses: $($s -replace '\s+', ' ')" "was accepted"
 }
 
-function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$tables=0,$procs=0,$db=0)
-    [pscustomobject]@{ login_name='DOMAIN\someone'; is_sysadmin=$sa; is_db_owner=$own; is_db_datawriter=$dw;
+function New-AccessRow { param($sa=0,$own=0,$dw=0,$ddl=0,$dr=1,$tables=0,$procs=0,$db=0,$as=$null)
+    [pscustomobject]@{ login_name='DOMAIN\someone'; acting_as=$as; is_sysadmin=$sa; is_db_owner=$own; is_db_datawriter=$dw;
                        is_db_ddladmin=$ddl; is_db_datareader=$dr; writable_tables=$tables;
                        executable_procs=$procs; database_write_perms=$db } }
 $verdictCases = @(
@@ -455,6 +478,8 @@ $verdictCases = @(
     @{ Args = @{ tables = 1 }; ReadOnly = $false; Label = 'one writable table anywhere' }
     @{ Args = @{ procs = 1 };  ReadOnly = $false; Label = 'one executable procedure' }
     @{ Args = @{ db = 1 };     ReadOnly = $false; Label = 'database-level CREATE/ALTER' }
+    @{ Args = @{ as = 'ro_query' }; ReadOnly = $true;  Label = 'running as ro_query' }
+    @{ Args = @{ as = 'dbo' };      ReadOnly = $false; Label = 'running as anyone but ro_query' }
 )
 foreach ($vc in $verdictCases) {
     $a = $vc.Args
@@ -473,7 +498,14 @@ Assert-True ($roqText -match 'Integrated Security=SSPI' -and $roqText -notmatch 
 # connection, and stop (never fall back) if that fails.
 Assert-Equal "EXECUTE AS USER = 'ro_query' WITH NO REVERT;" $script:SwitchSql 'switches to ro_query WITH NO REVERT'
 Assert-True ($roqText -match 'Pooling=false') 'the switched connection is never pooled'
-Assert-True ($roqText -match '(?s)\$script:SwitchSql.*?catch \{.*?exit 5') 'a failed switch exits before running anything'
+# Order matters, so check positions, not just presence: the switch executes,
+# its failure exits 5, and only then can a transaction (and the batch) start.
+$iSwitch = $roqText.IndexOf('$scmd.CommandText = $script:SwitchSql')
+$iExit   = if ($iSwitch -ge 0) { $roqText.IndexOf('exit 5', $iSwitch) } else { -1 }
+$iTx     = $roqText.IndexOf('$conn.BeginTransaction()')
+$iGate   = $roqText.IndexOf('if (-not $verdict.ReadOnly)')
+Assert-True ($iSwitch -ge 0 -and $iExit -gt $iSwitch -and $iTx -gt $iExit) 'the switch runs, and a failed switch exits, before any transaction starts'
+Assert-True ($iGate -gt $iSwitch -and $iGate -lt $iTx) 'a non-read-only access verdict stops the run before any transaction starts'
 
 $cfgDir = Join-Path $env:TEMP ("roq-cfg-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $cfgDir | Out-Null
