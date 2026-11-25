@@ -169,7 +169,7 @@ expressed, since they are not declared as foreign keys.
 
 Horizon's schema is, for practical purposes, primary-key-free. A handful of
 `PRIMARY KEY` constraints exist — typically on circulation tables — and that is
-all. [`site-profile.md`](site-profile.md#keys--and-the-pk_-trap) lists yours in
+all. [`site-profile.md`](site-profile.md#keys---and-the-pk_-trap) lists yours in
 full; it is a short list.
 
 ### The naming trap

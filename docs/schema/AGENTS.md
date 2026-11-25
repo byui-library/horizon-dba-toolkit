@@ -198,7 +198,7 @@ tool that looks for declared PKs to find join keys will find almost nothing and
 conclude, wrongly, that the tables are unkeyed. The generated `index/` pages
 already resolve grain from unique indexes — use them.
 
-> **How many at your site:** [`site-profile.md`](site-profile.md#keys--and-the-pk_-trap)
+> **How many at your site:** [`site-profile.md`](site-profile.md#keys---and-the-pk_-trap)
 > lists the declared primary keys in full, beside the count of indexes merely
 > *named* like one. Expect the declared list to be very short and mostly
 > circulation tables.

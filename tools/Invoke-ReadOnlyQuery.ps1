@@ -113,6 +113,14 @@ function Test-ReadOnlySql {
         refused. Fails CLOSED: anything it cannot positively accept is refused.
     #>
     param([string] $Code)
+    # The committed solutions use placeholders for site values (CLAUDE.md).
+    # Run unedited, they return a plausible answer about nobody - usually 0,
+    # which a post-delete check reads as success. Case-sensitive, quoted and
+    # exact, so real values and ordinary text never trip it.
+    $m = [regex]::Match($Code, "'(CATALOGER|OTHERUSER|HZUSER|LOC|ILSSERVER|ILSDB|ils_svc|staff_readers)'")
+    if ($m.Success) {
+        return "still contains the placeholder $($m.Value). Replace it with the real value (the private handoff file lists them). A result from a placeholder is meaningless - it usually comes back 0."
+    }
     $bare = ConvertTo-BareSql -Code $Code
     if ($null -eq $bare) {
         return "has an unterminated string, comment or [identifier], so it cannot be checked."
@@ -219,7 +227,11 @@ $cfg = Get-HorizonSiteConfig -Path $ConfigPath
 $cs = "Server=$($cfg.Server);Database=$($cfg.Database);Integrated Security=SSPI;" +
       "Application Name=ReadOnlyQuery;ApplicationIntent=ReadOnly;Connect Timeout=15"
 $conn = New-Object System.Data.SqlClient.SqlConnection $cs
-$conn.Open()
+try { $conn.Open() } catch {
+    Write-Host "COULD NOT CONNECT to $($cfg.Server) / $($cfg.Database):" -ForegroundColor Red
+    Write-Host "  $($_.Exception.InnerException.Message)$(if (-not $_.Exception.InnerException) { $_.Exception.Message })" -ForegroundColor Red
+    exit 4
+}
 
 $adt = New-Object System.Data.DataTable
 try {
@@ -299,6 +311,20 @@ try {
             Write-Host "WARNING: the batch ended the transaction itself, so it could not be rolled back. Tell the maintainer." -ForegroundColor Red
         }
     }
+} catch [System.Data.SqlClient.SqlException] {
+    # A SQL error is an answer, not a crash: show SQL Server's own message,
+    # plainly, and exit 4. The rollback above has already run.
+    $conn.Close()
+    Write-Host "SQL ERROR - the database rejected the query (nothing was changed):" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    exit 4
+} catch [System.Management.Automation.MethodInvocationException] {
+    $inner = $_.Exception.InnerException
+    if (-not ($inner -is [System.Data.SqlClient.SqlException])) { throw }
+    $conn.Close()
+    Write-Host "SQL ERROR - the database rejected the query (nothing was changed):" -ForegroundColor Red
+    Write-Host "  $($inner.Message)" -ForegroundColor Red
+    exit 4
 } finally {
     $conn.Close()
 }

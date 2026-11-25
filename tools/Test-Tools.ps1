@@ -295,9 +295,18 @@ try {
 # ---------------------------------------------------------------------------
 Group 'Generators run against the real repo'
 
-$gen = & powershell -ExecutionPolicy Bypass -File (Join-Path $toolsDir 'Build-SolutionDocs.ps1') 2>&1
-Assert-True ($LASTEXITCODE -eq 0) 'Build-SolutionDocs exits 0'
-Assert-True (($gen -join "`n") -match 'sql file\(s\)') 'Build-SolutionDocs reports generated files'
+# Built into a throwaway copy, never in place: rewriting the tracked sql/ and
+# runbook.html files leaves a clone with "modified" files (line endings alone
+# are enough), and then `git pull` refuses to run - which broke the cataloger's
+# daily routine in the 2026-11-25 walkthrough.
+$genRoot = Join-Path $env:TEMP ("bsd-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $genRoot | Out-Null
+try {
+    Copy-Item (Join-Path $repoRoot 'solutions') $genRoot -Recurse
+    $gen = & powershell -ExecutionPolicy Bypass -File (Join-Path $toolsDir 'Build-SolutionDocs.ps1') -RepoRoot $genRoot 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'Build-SolutionDocs exits 0'
+    Assert-True (($gen -join "`n") -match 'sql file\(s\)') 'Build-SolutionDocs reports generated files'
+} finally { Remove-Item -Recurse -Force $genRoot -ErrorAction SilentlyContinue }
 
 # The schema exports are each site's own and are absent from a fresh clone -
 # see SETUP.md step 2. Skipped with a note rather than failed, because "you have
@@ -383,7 +392,9 @@ $reads = @(
     "SELECT [delete], ""update"" FROM t",
     "SELECT 'it''s -- not a comment' AS a, 'and /* not */ this' AS b",
     "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT COUNT(*) FROM item",
-    "SELECT text FROM bib WHERE text LIKE '%COMMIT%'"
+    "SELECT text FROM bib WHERE text LIKE '%COMMIT%'",
+    "SELECT COUNT(*) FROM bib_control WHERE create_user = 'cataloger_jane'",
+    "SELECT * FROM location WHERE name LIKE '%LOC%'"
 )
 foreach ($s in $reads) {
     $why = Test-ReadOnlySql -Code $s
@@ -421,7 +432,10 @@ $writes = @(
     "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1",
     # Unterminated constructs cannot be reasoned about.
     "SELECT 'unterminated",
-    "SELECT 1 /* never closed"
+    "SELECT 1 /* never closed",
+    # Unedited placeholders return a meaningless (usually 0) answer.
+    "SELECT COUNT(*) FROM bib_control bc WHERE bc.create_user = 'CATALOGER'",
+    "SELECT name FROM location WHERE location = 'LOC'"
 )
 foreach ($s in $writes) {
     $why = Test-ReadOnlySql -Code $s
