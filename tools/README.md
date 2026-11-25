@@ -9,6 +9,7 @@ directly, so no `SqlServer` module is needed. Nothing has to be installed.
 
 | Script | Group | Touches the catalog? |
 | --- | --- | --- |
+| [`Invoke-ReadOnlyQuery.ps1`](#invoke-readonlyqueryps1) | query | no (read-only, enforced) |
 | [`Get-SiteProfile.ps1`](#get-siteprofileps1) | setup | no (read-only) |
 | [`Generate-SchemaDocs.ps1`](#generate-schemadocsps1) | setup | no |
 | [`Test-Tools.ps1`](#test-toolsps1) | — | no (no database at all) |
@@ -154,6 +155,33 @@ an unexplained reason is a decision for a human holding the diagnostic. See
 ---
 
 # Script reference
+
+## `Invoke-ReadOnlyQuery.ps1`
+
+Runs one read-only batch against the database named in the gitignored
+`tools\site.local.psd1` (copy [`site.local.example.psd1`](site.local.example.psd1)),
+using Windows authentication. It prints the result and can save the first result
+set as a fully quoted UTF-8 CSV. This is the only route an AI assistant uses
+into the live catalog; see the root [`AGENTS.md`](../AGENTS.md).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT COUNT(*) AS n FROM bib_control"
+powershell -ExecutionPolicy Bypass -File tools\Invoke-ReadOnlyQuery.ps1 -File solutions\<name>\sql\01-....sql -OutCsv "excel reports\<name>.csv"
+```
+
+Read-only in three layers:
+
+1. **Refused before sending** if the batch contains a write (`INSERT`,
+   `UPDATE`, `DELETE`, `MERGE`, DDL, `GRANT`, `EXEC`, `SELECT ... INTO`, ...),
+   an external data source, a `GO`, or does not start with `SELECT`, `WITH`,
+   `DECLARE` or `SET`. Comments and string literals are stripped first, and the
+   check fails closed.
+2. **Always rolled back:** the batch runs inside a transaction that is rolled
+   back whatever happens.
+3. **A `db_datareader`-only login.** That one is for IT to grant, and it is the
+   only layer that holds if someone bypasses the script.
+
+`Test-Tools.ps1` covers the first layer with accepted and refused samples.
 
 ## `Get-SiteProfile.ps1`
 

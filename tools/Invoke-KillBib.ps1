@@ -125,6 +125,45 @@ function Show-OrphanDiagnostic {
     }
 }
 
+# --- run-time log ----------------------------------------------------------
+#
+# Records when each KillBib invocation started and finished, so a
+# point-in-time restore (RESTORE ... WITH STOPAT) can target the moment just
+# before the delete. The SERVER clock is recorded as well as this machine's,
+# because STOPAT is interpreted in the server's local time and the two clocks
+# need not agree.
+#
+# One file per delete-list table, appended to by every invocation - the trial,
+# the full run and any resume - in killbib-audit\, which .gitignore excludes.
+# Logging must never stop a delete or hide KillBib's output, so every failure
+# here is reported and swallowed.
+$script:RunLogPath = Join-Path (Join-Path (Split-Path -Parent $toolsDir) 'killbib-audit') "$Table-runs.log"
+
+function Get-ServerClock {
+    param([System.Management.Automation.PSCredential] $Cred)
+    try {
+        $c = New-HorizonConnection -Server $Server -Database $Database -Credential $Cred -AppName 'KillBib'
+        try {
+            # GETDATE/GETUTCDATE rather than SYSDATETIME: lowest common denominator.
+            return [string] (Invoke-HorizonScalar -Connection $c -Timeout 30 -Sql `
+                "SELECT CONVERT(varchar(23), GETDATE(), 121) + ' (UTC ' + CONVERT(varchar(23), GETUTCDATE(), 121) + ')';")
+        } finally { $c.Close() }
+    } catch {
+        return "unavailable: $($_.Exception.Message)"
+    }
+}
+
+function Write-RunLog {
+    param([string] $Line)
+    try {
+        $dir = Split-Path -Parent $script:RunLogPath
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Add-Content -LiteralPath $script:RunLogPath -Value $Line -Encoding ASCII
+    } catch {
+        Write-Host "  (could not write run log: $($_.Exception.Message))" -ForegroundColor DarkGray
+    }
+}
+
 function Invoke-KillBibRun {
     param(
         [string] $Exe,
@@ -175,6 +214,17 @@ function Invoke-KillBibRun {
     # its console. Everything KillBib prints is still visible on screen, and the
     # audit record lives in killbib-audit\<table>-<stamp>.csv, written before
     # anything is deleted.
+    # Taken immediately before launch: the restore point is "just before this".
+    $range = if ($BeginBib -and $EndBib) { "/b$BeginBib /e$EndBib" } elseif ($BeginBib) { "/b$BeginBib" } else { "whole list" }
+    $serverStart = Get-ServerClock -Cred $Cred
+    $localStart  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+    Write-RunLog ("START   {0,-8}  table={1}  expected={2}  range={3}  kill_mode={4}" -f `
+        $Label, $Table, $ExpectedRows, $range, $(if ($Brutal) { '/k' } else { 'default' }))
+    Write-RunLog ("        server_clock={0}" -f $serverStart)
+    Write-RunLog ("        local_clock={0}" -f $localStart)
+    Write-Host "  start time recorded: server $serverStart" -ForegroundColor DarkGray
+    Write-Host "  log: $script:RunLogPath" -ForegroundColor DarkGray
+
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     Push-Location -LiteralPath $exeDir
     try {
@@ -188,6 +238,11 @@ function Invoke-KillBibRun {
     $sw.Stop()
     $pw = $null
     $args = $null
+
+    Write-RunLog ("FINISH  {0,-8}  exit={1}  elapsed={2:N1}s" -f $Label, $code, $sw.Elapsed.TotalSeconds)
+    Write-RunLog ("        server_clock={0}" -f (Get-ServerClock -Cred $Cred))
+    Write-RunLog ("        local_clock={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))
+    Write-RunLog ""
 
     Write-Host ""
     Write-Host ("-" * 62) -ForegroundColor DarkGray

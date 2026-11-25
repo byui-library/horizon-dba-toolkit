@@ -16,9 +16,17 @@ excel reports/
 # behind docs/schema/ and must travel with the repo.
 !horizon-schema/*.csv
 
+# KillBib run records: the bib# audit CSVs and the start/finish time logs.
+# Catalog data and site run history - local only.
+killbib-audit/
+
 # Common local/OS cruft
 Thumbs.db
 .DS_Store
+
+# Local-only site config: the real server and database names.
+# tools/site.local.example.psd1 is the committed template.
+tools/site.local.psd1
 
 # Local-only denylist of real identifiers for the redaction guard.
 # Must never be committed - it exists so the real values stay OUT of the repo.

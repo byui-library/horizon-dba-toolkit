@@ -25,6 +25,7 @@ site does not have to repeat it.
 | If you want to… | Go to |
 | --- | --- |
 | Set this up against your database | **[SETUP.md](./SETUP.md)** |
+| Ask the catalog questions through Codex, as a cataloger | **[docs/cataloger-guide.md](./docs/cataloger-guide.md)** |
 | Write a query safely | **[docs/schema/AGENTS.md](./docs/schema/AGENTS.md)** |
 | Look up a fact about *your* site | [docs/schema/site-profile.md](./docs/schema/site-profile.md) *(generated)* |
 | Delete records in batch | [docs/killbib.md](./docs/killbib.md) + [tools/README.md](./tools/README.md) |
@@ -110,6 +111,7 @@ tools/            PowerShell: profiler, doc generators, delete-run scripts, test
 
 | Script | Purpose |
 | --- | --- |
+| `Invoke-ReadOnlyQuery.ps1` | the one way an assistant queries the live catalog: refuses writes, always rolls back |
 | `Get-SiteProfile.ps1` | measures what varies between sites, writes `site-profile.md` |
 | `Generate-SchemaDocs.ps1` | CSV exports → `docs/schema/index/` |
 | `New-Solution.ps1` | scaffolds a new solution in the required structure |
@@ -142,6 +144,10 @@ not the specifics.
   identifies local scratch and backup tables Horizon did not ship, checks nothing
   depends on them, and generates a reviewed `DROP` list. Useful at any site; it
   is also what keeps a schema export honest.
+* **[590-proquest-ebc-batch-removal](./solutions/590-proquest-ebc-batch-removal)** —
+  a **KillBib batch delete followed by a report**: removes one day's ProQuest
+  `590` load via `Invoke-DeleteListRun.ps1`, then reports every remaining Ebook
+  Central record (`035` EBC number plus its `590`s) as a one-row-per-bib CSV.
 
 Add your own with the scaffold rather than by hand:
 

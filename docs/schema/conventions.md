@@ -241,10 +241,13 @@ for **display in audit output only** — never for the value actually stored.
 
 Two practical consequences of the 255-character limit and the control characters:
 
-1. **Long fields split across rows.** Horizon continues a long `245`, `520`, or
-   `590` into additional rows with an incremented `tagord`. Reassembly means
-   ordering by `tagord`; the `245$a` parser used across this repo deliberately
-   takes only the lowest-`tagord` segment, which truncates the rare long title.
+1. **Long fields live in `bib_longtext`.** A field longer than 255 characters
+   keeps its `bib` row (`tag`, `tagord`) with `text` NULL, and the whole field
+   is stored in `bib_longtext.longtext`, keyed uniquely by `bib#, tag, tagord`.
+   Display it with `COALESCE(text, longtext)`, and remember that a `LIKE` on
+   `bib.text` cannot match it. *Corrected 2026-11-25*: this item used to say
+   long fields were split across `bib` rows. See
+   [AGENTS.md Rule 8](AGENTS.md#rule-8--marc-text-is-not-plain-text).
 2. **`FOR XML PATH` entitizes this column rather than failing on it.** The
    `CHAR(31)`/`CHAR(30)` delimiters come back as `&#x1F;` and `&#x1E;`, so the
    aggregate holds entity references where the delimiters were. It does **not**

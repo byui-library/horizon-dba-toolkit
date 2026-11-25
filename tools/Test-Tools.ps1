@@ -363,6 +363,57 @@ $missing  = @($sqlFiles | Where-Object {
 Assert-Equal 0 $missing.Count "all $($sqlFiles.Count) generated .sql files carry the GENERATED header"
 
 # ---------------------------------------------------------------------------
+Group 'Invoke-ReadOnlyQuery.ps1 refuses anything that is not a read'
+
+# Dot-sourcing loads the functions and returns before connecting.
+. (Join-Path $toolsDir 'Invoke-ReadOnlyQuery.ps1')
+
+$reads = @(
+    "SELECT COUNT(*) FROM bib_control",
+    "WITH c AS (SELECT 1 AS n) SELECT n FROM c",
+    "DECLARE @d int; SET @d = DATEDIFF(day, '1970-01-01', '2026-10-26'); SELECT @d",
+    "-- will not UPDATE anything`nSELECT 'DELETE me' AS note",
+    "SELECT b.[bib#] FROM bib b WHERE b.text LIKE '%INSERT INTO%'",
+    "SELECT update_date, deleteFlag FROM t"
+)
+foreach ($s in $reads) {
+    $why = Test-ReadOnlySql -Code $s
+    Assert-True ($null -eq $why) "accepts: $($s -replace '\s+', ' ')" "refused: $why"
+}
+$writes = @(
+    "UPDATE bib SET text = text WHERE 1 = 0",
+    "SELECT 1; DELETE FROM bib WHERE 1 = 0",
+    "SELECT * INTO dbo.x FROM bib_control",
+    "WITH c AS (SELECT 1 AS n) UPDATE t SET n = 1",
+    "MERGE t USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+    "EXEC sp_who",
+    "sp_help bib",
+    "SELECT * FROM OPENROWSET('x','y','z')",
+    "CREATE TABLE dbo.x (a int)",
+    "GRANT SELECT ON bib TO public",
+    "SELECT 1`nGO`nSELECT 2",
+    "/* SELECT */ DROP TABLE dbo.x",
+    "TRUNCATE TABLE dbo.x"
+)
+foreach ($s in $writes) {
+    $why = Test-ReadOnlySql -Code $s
+    Assert-True ($null -ne $why) "refuses: $($s -replace '\s+', ' ')" "was accepted"
+}
+
+$cfgDir = Join-Path $env:TEMP ("roq-cfg-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $cfgDir | Out-Null
+try {
+    Assert-Throws { Get-HorizonSiteConfig -Path (Join-Path $cfgDir 'missing.psd1') } 'missing site config throws with instructions' 'site.local.example.psd1'
+    $ph = Join-Path $cfgDir 'placeholder.psd1'
+    Copy-Item (Join-Path $toolsDir 'site.local.example.psd1') $ph
+    Assert-Throws { Get-HorizonSiteConfig -Path $ph } 'the unedited example config is refused' 'placeholder'
+} finally { Remove-Item -Recurse -Force $cfgDir }
+
+Assert-True (-not (& git -C $repoRoot ls-files 'tools/site.local.psd1')) 'tools/site.local.psd1 is not tracked'
+& git -C $repoRoot check-ignore -q 'tools/site.local.psd1'
+Assert-True ($LASTEXITCODE -eq 0) 'tools/site.local.psd1 is gitignored'
+
+# ---------------------------------------------------------------------------
 Group 'Redaction guard - no real site identifiers in tracked files'
 
 # The denylist holds the real values and is GITIGNORED, so the secrets never

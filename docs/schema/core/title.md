@@ -28,7 +28,8 @@ quick human-readable label, but it is **not** the MARC `245$a`.
 | The exact MARC `245$a` as catalogued | Parse `bib.text` where `tag = '245'` |
 
 Parsing `245$a` is more faithful but costs an `OUTER APPLY` and inherits the
-255-character split problem described in [`bib.md`](bib.md). `title.processed`
+long-field handling described in [`bib.md`](bib.md) (long `245`s are in
+`bib_longtext`). `title.processed`
 is one clean join. Pick according to whether the report is about *the MARC data*
 or *identifying the record to a human*.
 

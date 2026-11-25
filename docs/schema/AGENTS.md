@@ -85,6 +85,28 @@ awk -F, '$5=="ibarcode" {print $2}' "horizon-schema/all_tables_all_views.csv"
 no. Do not proceed on the assumption that the export is incomplete — it covers
 every table and view in the database it was taken from.
 
+### With a live connection, ask the database itself
+
+When `tools\site.local.psd1` is set up, the database is a better source than any
+export: it cannot be stale. Look names up with `tools\Invoke-ReadOnlyQuery.ps1`,
+which only runs reads:
+
+```powershell
+# every column of one table, with its declared (user-defined) and base type
+tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT c.column_id, c.name, TYPE_NAME(c.user_type_id) AS declared, TYPE_NAME(c.system_type_id) AS base, c.max_length, c.is_nullable FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.bib_longtext') ORDER BY c.column_id"
+
+# grain: the unique indexes, with their key columns
+tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT i.name, i.is_unique, c.name AS col, ic.key_ordinal FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID('dbo.bib_longtext') ORDER BY i.name, ic.key_ordinal"
+
+# which tables have a given column
+tools\Invoke-ReadOnlyQuery.ps1 -Sql "SELECT t.name FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id WHERE c.name = 'ibarcode' ORDER BY t.name"
+```
+
+The CSV exports remain the offline fallback, and the generated `index/` pages
+built from them are still the quickest way to get oriented. Where the live
+database and an export disagree, **the live database wins**. Re-export, because
+the difference means the export has gone stale.
+
 Markdown pages under [`index/`](index/) are for **orientation** (what exists,
 what its grain is). The CSVs are for **lookup** (exact names and types). Use the
 right one for the question; do not read a 14,000-row CSV to get oriented, and do
@@ -304,11 +326,37 @@ characters, **not** literal pipes:
 Build values as `CHAR(31)+'a'+@value+CHAR(30)`. Use a readable `'|a'+value`
 column **only** for display in audit output, never for what gets written.
 
-Because the column is 255 characters, Horizon **splits long fields across
-multiple rows**, incrementing `tagord`. A `245` or `520` may be spread over
-several rows; reassembling them means ordering by `tagord`. The `245$a` parser
-reused across this repo's reports takes the lowest-`tagord` segment only, which
-truncates the rare long title — a deliberate, documented trade.
+Because the column is 255 characters, **a longer field is not in `bib.text` at
+all.** Its `bib` row keeps `tag` and `tagord` but `text` is **NULL**, and the
+whole field lives in **`bib_longtext.longtext`** (a `text`-type column), keyed
+uniquely by `bib#, tag, tagord`. Long titles, `520` summaries and `035`s
+carrying many `$z` numbers end up there routinely.
+
+> **Corrected 2026-11-25.** This rule previously said Horizon splits long fields
+> across several `bib` rows with consecutive `tagord`s. Measured on a live
+> database, that is not what happens: the field moves wholesale to
+> `bib_longtext`. Confirm at your site with
+> `SELECT TOP 5 b.[bib#], b.tag FROM bib b WHERE b.text IS NULL`, then look those
+> rows up in `bib_longtext`.
+
+Two consequences, and both fail silently:
+
+- **Display.** Show `COALESCE(b.text, CAST(l.longtext AS varchar(8000)))` via
+  `LEFT JOIN bib_longtext l ON l.[bib#] = b.[bib#] AND l.tag = b.tag AND
+  l.tagord = b.tagord`. The join is on `bib_longtext`'s unique key, so it never
+  fans out. Without it, long titles and notes come out blank.
+- **Filtering.** `b.text LIKE '%term%'` cannot see a long field. Before
+  trusting a filter, count how many matches exist only in `bib_longtext`:
+
+```sql
+SELECT COUNT(DISTINCT l.[bib#]) AS [only_in_longtext]
+FROM bib_longtext l
+WHERE l.tag = '590' AND l.longtext LIKE '%ProQuest%'
+  AND NOT EXISTS (SELECT 1 FROM bib p WHERE p.[bib#] = l.[bib#]
+                    AND p.tag = '590' AND p.text LIKE '%ProQuest%');
+```
+
+  If that count is not zero, the filter must test both tables.
 
 To target one of several same-`tag` rows, isolate it by `tagord` (e.g.
 `MAX(tagord)` for the later duplicate). `HAVING COUNT(*) = N AND MIN(text) =
