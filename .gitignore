@@ -20,6 +20,10 @@ excel reports/
 # Catalog data and site run history - local only.
 killbib-audit/
 
+# Local working notes (session hand-offs, to-do lists). Site-specific by
+# nature, so never committed: name them *.local.md.
+*.local.md
+
 # Common local/OS cruft
 Thumbs.db
 .DS_Store
